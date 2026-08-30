@@ -112,7 +112,7 @@ class GPTQLinearKernel:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
-        reshaped_x = x.reshape(-1, x.shape[-1])
+        reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
 
         output = gptq_gemm(
             reshaped_x,

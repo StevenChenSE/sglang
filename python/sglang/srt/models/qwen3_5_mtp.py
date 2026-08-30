@@ -63,6 +63,7 @@ def _mtp_quant_config(quant_config):
             quant_config.get_name() == "modelopt_fp4"
             and quant_config.is_checkpoint_nvfp4_serialized
         )
+        or quant_config.get_name() in ("gptq", "gptq_marlin", "auto-round", "auto_round")
     ):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:

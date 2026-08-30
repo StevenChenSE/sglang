@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.utils.common import is_cuda, is_hip, is_host_cpu_arm64, is_npu
@@ -60,8 +61,11 @@ def handle_mps_backends(server_args: Any):
 
 def handle_amd_specifics(server_args: Any):
     if is_hip():
+        splits = envs.SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS.get()
+        if splits is None:
+            splits = 16
         declare_resolution(
-            server_args, "_handle_amd_specifics", triton_attention_num_kv_splits=16
+            server_args, "_handle_amd_specifics", triton_attention_num_kv_splits=splits
         )
 
 

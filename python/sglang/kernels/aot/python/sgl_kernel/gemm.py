@@ -108,4 +108,62 @@ def gptq_gemm(
 
 
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
-    torch.torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)
+    torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)
+
+
+def gptq_gemm_rdna3(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_v2_format: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.gptq_gemm_rdna3(
+        a, b_q_weight, b_qzeros, b_scales, b_g_idx, use_v2_format
+    )
+
+
+def gptq_gemm_rdna3_wmma(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_v2_format: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.gptq_gemm_rdna3_wmma(
+        a, b_q_weight, b_qzeros, b_scales, b_g_idx, use_v2_format
+    )
+
+
+def moe_gptq_gemm_rdna3(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool = True,
+    output_topk: int = 1,
+) -> None:
+    torch.ops.sgl_kernel.moe_gptq_gemm_rdna3(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        b_qzeros,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+    )

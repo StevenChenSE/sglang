@@ -980,6 +980,7 @@ class Envs:
     # Triton and Torch compilation
     # ===================================================================
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
+    SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS = EnvInt(None)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
     # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
     # standard Triton decode kernel even if --enable-lean-attention or the auto-gate

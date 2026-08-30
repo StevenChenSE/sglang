@@ -33,11 +33,18 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
+import sysconfig
+
 operator_namespace = "sgl_kernel"
+py_include = Path(sys.prefix) / "include" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+if not (py_include / "Python.h").exists():
+    py_include = root.parent.parent.parent.parent / "pydev/usr/include" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+
 include_dirs = [
     root / "include",
     root / "include" / "impl",
     root / "csrc",
+    py_include,
 ]
 
 sources = [
@@ -57,6 +64,11 @@ sources = [
     "csrc/kvcacheio/transfer.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
+    "csrc/quantization/gguf/gguf_kernel.cu",
+    "csrc/gemm/gptq/gptq_kernel.cu",
+    "csrc/gemm/gptq/q_gemm_rdna3.cu",
+    "csrc/gemm/gptq/q_gemm_rdna3_wmma.cu",
+    "csrc/gemm/gptq/moe_q_gemm_rdna3.cu",
 ]
 
 cxx_flags = ["-O3"]
@@ -74,11 +86,21 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
+# RDNA consumer / APU targets (wave32)
+RDNA_TARGETS = {"gfx1100", "gfx1151", "gfx1201"}
+is_rdna = amdgpu_target in RDNA_TARGETS
+
+if amdgpu_target not in ["gfx942", "gfx950", "gfx1250", "gfx1100", "gfx1151", "gfx1201"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        "Expected 'gfx942', 'gfx950', 'gfx1250', 'gfx1100', 'gfx1151', or 'gfx1201'."
     )
     sys.exit(1)
+
+# On RDNA the CDNA-only all-reduce collectives are not built (no MUBUF / peer-IPC
+# fast paths there; multi-GPU falls back to RCCL), so drop their sources.
+if is_rdna:
+    sources = [s for s in sources if not s.startswith("csrc/allreduce/")]
 
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
@@ -89,7 +111,8 @@ fp8_macro = (
 #   (leaves room for static shared allocations in the kernel).
 # - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
 #   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 40 * 1024
+# - RDNA (gfx1100/gfx1151/gfx1201): 64KB LDS per workgroup -> same 48KB budget as gfx942.
+topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target in ("gfx942", *RDNA_TARGETS) else 40 * 1024
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -104,6 +127,15 @@ hipcc_flags = [
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
+
+# On RDNA the CDNA-only all-reduce collectives are not built; guard their
+# registration (common_extension_rocm.cc) and declarations (sgl_kernel_ops.h).
+# The flag must reach BOTH compilers: hipcc for the .hip/.cu sources (headers)
+# and the host C++ compiler for common_extension_rocm.cc (a .cc file), otherwise
+# the registration is compiled in and links against the excluded symbols.
+if is_rdna:
+    hipcc_flags.append("-DSGL_IS_RDNA")
+    cxx_flags.append("-DSGL_IS_RDNA")
 
 ext_modules = [
     CUDAExtension(

@@ -30,9 +30,11 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_device_core_count, is_gfx95_supported, is_hip
+from sglang.srt.utils import get_device_core_count, is_gfx95_supported, is_hip, is_rdna_supported
 
 _is_hip = is_hip()
+_is_rdna = _is_hip and is_rdna_supported()
+_IS_RDNA = tl.constexpr(bool(_is_rdna))
 
 logger = logging.getLogger(__name__)
 
@@ -651,7 +653,14 @@ def _fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        q_k = q.to(K_Buffer.dtype.element_ty)
+        # On RDNA3/4 (gfx1100-1201), native WMMA is BF16/FP16. Dequantize FP8 KV in registers
+        # directly to q.dtype so the dot products execute via native v_wmma hardware instructions
+        # without emitting software FP8-emulation ALU sequences.
+        IS_FP8_KV: tl.constexpr = K_Buffer.dtype.element_ty.is_fp8()
+        if IS_FP8_KV and _IS_RDNA:
+            q_k = q
+        else:
+            q_k = q.to(K_Buffer.dtype.element_ty)
         if BLOCK_DPE > 0:
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
@@ -679,6 +688,8 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
+            if IS_FP8_KV and _IS_RDNA:
+                k = k.to(tl.float32).to(q.dtype)
             qk = tl.dot(q_k, k)
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
@@ -736,6 +747,8 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                     other=0.0,
                 )
+                if IS_FP8_KV and _IS_RDNA:
+                    v = v.to(tl.float32).to(q.dtype)
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -829,10 +842,14 @@ def _decode_grouped_att_m_fwd(
     num_stages = 2
     num_warps = 4
     if _is_hip:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
+        if _is_rdna:
+            num_stages = 1
+            num_warps = 4
+        else:
+            # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
+            # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
+            extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+            num_stages = 1
 
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide
@@ -1018,7 +1035,7 @@ def _decode_softmax_reducev_fwd(
     HAS_SINK = sinks is not None
 
     extra_kargs = {}
-    if _is_hip:
+    if _is_hip and not _is_rdna:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
@@ -1550,8 +1567,13 @@ def _lean_attention_decode_kernel(
         )  # [BLOCK_M, BLOCK_DMODEL]
         # Cast q to the K buffer dtype so the main dot is a same-dtype MMA. For fp8 KV this
         # makes it dot(fp8, fp8) (triton rejects a bf16xfp8 mix); k_scale is folded into
-        # sm_scale to dequantize. For bf16/fp16 KV this is a no-op. Mirrors the standard kernel.
-        q_k = q.to(K_Buffer.dtype.element_ty)
+        # sm_scale to dequantize. On RDNA3/4 (gfx1100-1201), dequantize in registers to q.dtype
+        # so execution uses native WMMA hardware instructions.
+        IS_FP8_KV_LEAN: tl.constexpr = K_Buffer.dtype.element_ty.is_fp8()
+        if IS_FP8_KV_LEAN and _IS_RDNA:
+            q_k = q
+        else:
+            q_k = q.to(K_Buffer.dtype.element_ty)
 
         # MLA rope split: the positional-encoding dims live in [BLOCK_DMODEL, Lk).
         if BLOCK_DPE > 0:
@@ -1609,6 +1631,8 @@ def _lean_attention_decode_kernel(
                 mask=(offs_n[None, :] < tok_end) & (mask_d[:, None]),
                 other=0.0,
             )
+            if IS_FP8_KV_LEAN and _IS_RDNA:
+                k = k.to(tl.float32).to(q.dtype)
 
             qk = tl.dot(q_k, k)  # [BLOCK_M, BLOCK_N]
             if BLOCK_DPE > 0:
@@ -1661,6 +1685,8 @@ def _lean_attention_decode_kernel(
                 mask=(offs_n[:, None] < tok_end) & (mask_dv[None, :]),
                 other=0.0,
             )
+            if IS_FP8_KV_LEAN and _IS_RDNA:
+                v = v.to(tl.float32).to(q.dtype)
 
             acc *= re_scale[:, None]
             acc += tl.dot(p.to(v.dtype), v)  # [BLOCK_M, BLOCK_DV]

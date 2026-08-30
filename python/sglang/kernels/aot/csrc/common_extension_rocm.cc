@@ -68,7 +68,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   /*
    * From csrc/allreduce
+   *
+   * CDNA-only: these collectives are not built on RDNA, so
+   * skip their registration there -- otherwise the extension links against
+   * symbols that were never compiled.
    */
+#ifndef SGL_IS_RDNA
   m.def(
       "init_custom_ar(Tensor meta, Tensor rank_data, "
       "str[] handles, int[] offsets, int rank, "
@@ -128,6 +133,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   // Max input size in bytes
   m.def("qr_max_size", &qr_max_size);
+#endif  // !SGL_IS_RDNA
 
   /*
    * From csrc/moe
@@ -244,6 +250,90 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
+
+  /*
+   * From csrc/quantization/gguf
+   */
+  m.def(
+      "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
+      "dtype) -> Tensor");
+  m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
+
+  m.def(
+      "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
+      "-> Tensor");
+  m.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
+
+  m.def("ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
+  m.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
+
+  m.def(
+      "ggml_moe_a8(Tensor X, Tensor W, "
+      "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
+      "num_tokens_post_padded, "
+      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+  m.impl("ggml_moe_a8", torch::kCUDA, &ggml_moe_a8);
+
+  m.def(
+      "ggml_moe_a8_vec(Tensor X, Tensor W, "
+      "Tensor topk_ids, int top_k, "
+      "int type, SymInt row, SymInt tokens) -> Tensor");
+  m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
+
+  m.def("ggml_moe_get_block_size(int type) -> int");
+  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+
+  /*
+   * From csrc/gemm/gptq
+   */
+  extern torch::Tensor gptq_gemm(
+      torch::Tensor a,
+      torch::Tensor b_q_weight,
+      torch::Tensor b_gptq_qzeros,
+      torch::Tensor b_gptq_scales,
+      torch::Tensor b_g_idx,
+      bool use_shuffle,
+      int64_t bit);
+  extern void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
+  extern torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
+                                       torch::Tensor b_qzeros, torch::Tensor b_scales,
+                                       torch::Tensor b_g_idx, bool use_v2_format);
+  extern torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
+                                            torch::Tensor b_qzeros,
+                                            torch::Tensor b_scales,
+                                            torch::Tensor b_g_idx, bool use_v2_format);
+  extern void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
+                                  torch::Tensor b_q_weight, torch::Tensor b_scales,
+                                  torch::Tensor b_qzeros, torch::Tensor topk_weights,
+                                  torch::Tensor sorted_token_ids,
+                                  torch::Tensor expert_ids,
+                                  torch::Tensor num_tokens_post_padded, int64_t top_k,
+                                  int64_t block_size_m, bool mul_topk_weight,
+                                  int64_t output_topk);
+
+  m.def(
+      "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
+      "use_shuffle, int bit) -> Tensor");
+  m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
+
+  m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
+  m.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
+
+  m.def(
+      "gptq_gemm_rdna3(Tensor a, Tensor b_q_weight, Tensor b_qzeros, Tensor b_scales, Tensor b_g_idx, bool "
+      "use_v2_format) -> Tensor");
+  m.impl("gptq_gemm_rdna3", torch::kCUDA, &gptq_gemm_rdna3);
+
+  m.def(
+      "gptq_gemm_rdna3_wmma(Tensor a, Tensor b_q_weight, Tensor b_qzeros, Tensor b_scales, Tensor b_g_idx, bool "
+      "use_v2_format) -> Tensor");
+  m.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
+
+  m.def(
+      "moe_gptq_gemm_rdna3(Tensor a, Tensor! c, Tensor b_q_weight, Tensor b_scales, Tensor b_qzeros, Tensor "
+      "topk_weights, Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_padded, int top_k, "
+      "int block_size_m, bool mul_topk_weight, int output_topk) -> ()");
+  m.impl("moe_gptq_gemm_rdna3", torch::kCUDA, &moe_gptq_gemm_rdna3);
 }
 
 REGISTER_EXTENSION(common_ops)

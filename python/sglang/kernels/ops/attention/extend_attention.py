@@ -26,13 +26,15 @@ from sglang.kernels.ops.attention.prefill_attention import (
 )
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_rdna_supported
 
 _is_cuda = is_cuda()
 if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
+_is_rdna = _is_hip and is_rdna_supported()
+_IS_RDNA = tl.constexpr(bool(_is_rdna))
 _is_gfx95 = _is_hip and is_gfx95_supported()
 
 try:
@@ -73,7 +75,12 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        if _is_gfx95 and _is_triton_ge_37 and Lq == 576 and Lv == 512:
+        if _is_rdna:
+            # RDNA3/4 (gfx1100-1201): Dual 32-wide SIMD per CU, low LDS footprint.
+            # 32x32 tiles compile in ~3.5s and prevent LLVM backend regalloc hangs (64x64 triggers >60s stall).
+            BLOCK_M, BLOCK_N = (32, 32)
+            num_warps = 4
+        elif _is_gfx95 and _is_triton_ge_37 and Lq == 576 and Lv == 512:
             # Triton 3.7's N64 codegen reaches 512 VGPRs and spills 472 bytes
             # of scratch on gfx950. N32 keeps BLOCK_M/launch work unchanged,
             # uses <=433 VGPRs without scratch, and restores the isolated
@@ -519,7 +526,12 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q.to(k.dtype), k)
+            IS_FP8_KV: tl.constexpr = K_Buffer.dtype.element_ty.is_fp8()
+            if IS_FP8_KV and _IS_RDNA:
+                k = k.to(tl.float32).to(q.dtype)
+                qk = tl.dot(q, k)
+            else:
+                qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_kpe = (
@@ -592,7 +604,11 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
+            if IS_FP8_KV and _IS_RDNA:
+                v = v.to(tl.float32).to(q.dtype)
+                p = p.to(q.dtype)
+            else:
+                p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
 
             e_max = n_e_max
@@ -826,9 +842,9 @@ def extend_attention_fwd(
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
     # Compact grid: AMD/HIP-only optimization (parity with flash-attn's ragged-aware
-    # launch). Explicitly check _is_hip and allow env var override.
+    # launch). CDNA (gfx9) uses this, but RDNA3/4 (gfx11/12) stalls on dynamic while loops.
     use_compact_tile_grid = (
-        _is_hip and envs.SGLANG_TRITON_COMPACT_EXTEND_ATTENTION.get()
+        _is_hip and not _is_rdna and envs.SGLANG_TRITON_COMPACT_EXTEND_ATTENTION.get()
     )
     compact_q_tiles = None
     if use_compact_tile_grid:
@@ -848,7 +864,7 @@ def extend_attention_fwd(
     num_stages = 1
 
     extra_kargs = {}
-    if _is_hip:
+    if _is_hip and not _is_rdna:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
@@ -1179,7 +1195,12 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            qk = tl.dot(q.to(k.dtype), k)
+            IS_FP8_KV: tl.constexpr = K_Buffer.dtype.element_ty.is_fp8()
+            if IS_FP8_KV and _IS_RDNA:
+                k = k.to(tl.float32).to(q.dtype)
+                qk = tl.dot(q, k)
+            else:
+                qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_kpe = (
@@ -1253,7 +1274,11 @@ def _fwd_kernel_unified(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
+            if IS_FP8_KV and _IS_RDNA:
+                v = v.to(tl.float32).to(q.dtype)
+                p = p.to(q.dtype)
+            else:
+                p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
 
             e_max = n_e_max
@@ -1351,7 +1376,7 @@ def extend_attention_fwd_unified(
     num_stages = 1
 
     extra_kargs = {}
-    if _is_hip:
+    if _is_hip and not _is_rdna:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(

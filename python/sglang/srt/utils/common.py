@@ -953,7 +953,11 @@ def get_device_count() -> int:
 
 def get_device_core_count(device_id: int = 0) -> int:
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
-        return torch.cuda.get_device_properties(device_id).multi_processor_count
+        mp_count = torch.cuda.get_device_properties(device_id).multi_processor_count
+        if is_hip() and is_rdna_supported():
+            # RDNA reports WGP count via multi_processor_count; each WGP has 2 Compute Units (CUs).
+            return mp_count * 2
+        return mp_count
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_properties(device_id).gpu_eu_count
 
@@ -1047,6 +1051,20 @@ def is_gfx942_supported():
         return any(gfx in gcn_arch for gfx in ["gfx942"])
     else:
         return False
+
+
+@lru_cache(maxsize=1)
+def is_rdna_supported():
+    """
+    Returns whether the current platform is AMD RDNA (gfx10xx, gfx11xx, gfx12xx).
+    """
+    if torch.version.hip and hasattr(torch, "cuda") and torch.cuda.is_available():
+        try:
+            gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+            return any(gfx in gcn_arch for gfx in ["gfx10", "gfx11", "gfx12"])
+        except Exception:
+            return False
+    return False
 
 
 def get_hip_version():

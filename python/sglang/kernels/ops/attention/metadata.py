@@ -30,14 +30,18 @@ def get_num_kv_splits_triton(
     min_seq_len = tl.min(seq_lens)
     if max_seq_len * 8 < min_seq_len * 10:
         min_seq_len = max_seq_len
+    max_seq_len = tl.maximum(max_seq_len, 1)
+    min_seq_len = tl.maximum(min_seq_len, 1)
     max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
-    kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
+    max_kv_splits_1 = tl.maximum(max_kv_splits_1, 1)
+    kv_chunk_size_1 = tl.maximum(tl.cdiv(max_seq_len, max_kv_splits_1), 1)
 
     # NOTE: this is a hack to let num_kv_split grows up with seqlen gradually
     ext_seq_len = tl.cast(max_seq_len, tl.float32) / 64.0
     ext_device_core_count = tl.cast(
         device_core_count * tl.maximum(tl.log2(ext_seq_len), 1.0), tl.int32
     )
+    ext_device_core_count = tl.maximum(ext_device_core_count, 1)
     block_h, num_kv_group = 16, num_head // num_kv_head
     if num_kv_group == 1:
         token_grid = num_seq * num_group * num_head
@@ -45,14 +49,17 @@ def get_num_kv_splits_triton(
         # from triton_ops/decode_attention.py:_decode_grouped_att_m_fwd
         block_h = tl.minimum(block_h, num_kv_group)
         token_grid = num_seq * num_group * tl.cdiv(num_head, block_h)
+    token_grid = tl.maximum(token_grid, 1)
     max_kv_splits_2 = tl.minimum(
         tl.cdiv(ext_device_core_count, token_grid), max_kv_splits
     )
-    kv_chunk_size_2 = tl.cdiv(max_seq_len, max_kv_splits_2)
+    max_kv_splits_2 = tl.maximum(max_kv_splits_2, 1)
+    kv_chunk_size_2 = tl.maximum(tl.cdiv(max_seq_len, max_kv_splits_2), 1)
 
     num_kv_splits = tl.maximum(
         tl.cdiv(seq_lens, kv_chunk_size_1), tl.cdiv(seq_lens, kv_chunk_size_2)
     )
+    num_kv_splits = tl.minimum(tl.maximum(num_kv_splits, 1), max_kv_splits)
 
     offs_token = offs_seq * num_group
     mask_token = offs_token < num_seq * num_group

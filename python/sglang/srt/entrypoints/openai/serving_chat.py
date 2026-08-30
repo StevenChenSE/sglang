@@ -983,21 +983,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if request.stream:
             if request.return_prompt_token_ids:
-                raise ValueError(
-                    "return_prompt_token_ids is not supported with streaming. "
-                    "Please set stream=false when using return_prompt_token_ids=true."
-                )
+                raise ValueError("return_prompt_token_ids is not supported in streaming mode")
             if request.return_token_ids:
-                raise ValueError(
-                    "return_token_ids is not supported with streaming on "
-                    "/v1/chat/completions. Please set stream=false when using "
-                    "return_token_ids=true."
-                )
+                raise ValueError("return_token_ids is not supported in streaming mode")
             if request.return_meta_info:
-                raise ValueError(
-                    "return_meta_info is not supported with streaming. "
-                    "Please set stream=false when using return_meta_info=true."
-                )
+                raise ValueError("return_meta_info is not supported in streaming mode")
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
