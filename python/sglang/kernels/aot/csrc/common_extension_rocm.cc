@@ -310,7 +310,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
                                   torch::Tensor num_tokens_post_padded, int64_t top_k,
                                   int64_t block_size_m, bool mul_topk_weight,
                                   int64_t output_topk);
-  extern void wmma_flight_set(torch::Tensor t);
 
   m.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
@@ -330,10 +329,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "use_v2_format) -> Tensor");
   m.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
 
-  m.def("wmma_flight_set(Tensor t) -> ()");
-  // The planes tensor is PINNED HOST memory (device writes it directly), so
-  // the dispatcher must route CPU tensors here; the body is host-side only.
-  m.impl("wmma_flight_set", torch::kCPU, &wmma_flight_set);
 
   // Ported vLLM skinny GEMMs (wvSplitK family) for the vocab logits GEMV.
   extern torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,

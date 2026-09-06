@@ -137,14 +137,6 @@ def gptq_gemm_rdna3_wmma(
     )
 
 
-def wmma_flight_set(planes: torch.Tensor) -> None:
-    """12.165: install pinned-host int32 flight planes for the WMMA kernels.
-
-    Layout: tag*2+0 = entry marks, tag*2+1 = exit marks (tags 1..7), each
-    plane WMMA_FLIGHT_SLOTN = 32768 slots indexed by linear block id. Marks
-    persist (never cleared) — a wedge snapshot is the last state.
-    """
-    torch.ops.sgl_kernel.wmma_flight_set(planes)
 
 
 def moe_gptq_gemm_rdna3(

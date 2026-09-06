@@ -33,7 +33,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -738,9 +737,7 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
   // guard, which is now guaranteed to be a's device.
   // SGL_FORCE_SCALAR_GPTQ=1 routes every shape to the scalar kernel below —
   // counterfactual switch for the WMMA-wedge bisect (12.165).
-  static const bool force_scalar_gptq =
-      std::getenv("SGL_FORCE_SCALAR_GPTQ") != nullptr;
-  if (!force_scalar_gptq && a.dim() == 2 && b_q_weight.dim() == 2 &&
+  if (a.dim() == 2 && b_q_weight.dim() == 2 &&
       a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0 &&
       ((a.scalar_type() == torch::kBFloat16 && a.size(0) >= 16) ||
        (a.scalar_type() == torch::kHalf && a.size(0) >= 64))) {
