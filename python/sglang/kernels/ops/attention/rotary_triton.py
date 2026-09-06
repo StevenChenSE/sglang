@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.utils import get_witness
+
 
 @triton.jit
 def _triton_mrope_forward_fused(
@@ -32,14 +34,21 @@ def _triton_mrope_forward_fused(
     is_interleaved_glm: tl.constexpr,
     is_neox_style: tl.constexpr,
     axis_map_ptr,
+    witness_ptr,
+    max_position,
 ):
     pid = tl.program_id(0)
     q_ptr = q_ptr + pid * q_stride
     k_ptr = k_ptr + pid * k_stride
     half_rd = rd // 2
-    t = tl.load(positions_ptr + 0 * positions_stride + pid)
-    h = tl.load(positions_ptr + 1 * positions_stride + pid)
-    w = tl.load(positions_ptr + 2 * positions_stride + pid)
+    t = tl.load(positions_ptr + 0 * positions_stride + pid).to(tl.int64)
+    h = tl.load(positions_ptr + 1 * positions_stride + pid).to(tl.int64)
+    w = tl.load(positions_ptr + 2 * positions_stride + pid).to(tl.int64)
+    if not ((t >= 0) & (t < max_position) & (h >= 0) & (h < max_position) & (w >= 0) & (w < max_position)):
+        tl.store(witness_ptr + 0, 10)
+        tl.store(witness_ptr + 1, t.to(tl.int32))
+        tl.store(witness_ptr + 2, pid)
+        return
     t_cos = cos_sin_cache_ptr + t * rd
     h_cos = cos_sin_cache_ptr + h * rd
     w_cos = cos_sin_cache_ptr + w * rd
@@ -150,6 +159,8 @@ def triton_mrope_fused(
         mrope_interleaved_glm,
         is_neox_style,
         axis_map,
+        get_witness(q.device),
+        cos_sin_cache.shape[0],
     )
 
 

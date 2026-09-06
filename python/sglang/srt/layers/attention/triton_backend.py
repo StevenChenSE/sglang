@@ -6,7 +6,36 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
+import logging
+import os
+import traceback as _traceback
+
+# 12.145: host-side pool guard (SGL_POOL_GUARD=1) — validates kv walk entries
+# before kernels consume them; raises with a traceback instead of faulting GPU.
+_SGL_POOL_GUARD = bool(os.environ.get("SGL_POOL_GUARD"))
+
+
+def _guard_kv_indices(kv_indices, pool_size: int, tag: str) -> None:
+    # .item() syncs — illegal (and useless: dummy data) during graph capture.
+    if torch.cuda.is_current_stream_capturing():
+        return
+    try:
+        mx = int(kv_indices.max().item())
+        mn = int(kv_indices.min().item())
+    except Exception:
+        return
+    if mn < 0 or mx >= pool_size:
+        head = (
+            f"POOL GUARD VIOLATION kv_indices[{tag}]: min={mn} max={mx} "
+            f"allowed=[0, {pool_size})"
+        )
+        with open(os.path.expanduser("~/pool_guard.log"), "a") as f:
+            f.write(f"\n==== {head}\n")
+            f.write("".join(_traceback.format_stack()[-30:]) + "\n")
+        raise RuntimeError(head)
+
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.attention.fla.flight_recorder import record, record_with_ring
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
@@ -105,12 +134,33 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
     )
 
 
+def _verify_splitkv_arch_supported() -> bool:
+    """Split-KV verify kernel arch gate.
+
+    Originally gfx95-only (CDNA tuned), but the kernel is plain Triton and its
+    launch hints (waves_per_eu / matrix_instr_nonkdim) are already used by the
+    extend/decode attention kernels on RDNA3. gfx1100 (RX 7900 XTX, 96 CUs)
+    benefits from bandwidth-efficient split-KV over the serial-prefix extend
+    kernel for target-verify, especially at depth. The kernel's block config
+    table already covers head_dim 256.
+    """
+    if is_gfx95_supported():
+        return True
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ("gfx110", "gfx115"))
+    return False
+
+
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
         return logit_cap
     else:
         raise ValueError()
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -141,6 +191,12 @@ class ForwardMetadata:
     lean_Lp: Optional[torch.Tensor] = None
     lean_Op: Optional[torch.Tensor] = None
     lean_locks: Optional[torch.Tensor] = None
+    # rdna unified kernel, DRAFT_EXTEND_V2 (12.141): prefix-only walk +
+    # extend out_cache_loc (ntok per req), full lens in rdna_kv_lens.
+    rdna_full_kv_indptr: Optional[torch.Tensor] = None
+    rdna_kv_lens: Optional[torch.Tensor] = None
+    rdna_extend_ocl: Optional[torch.Tensor] = None
+    rdna_extend_ntok: int = 0
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -195,6 +251,17 @@ class TritonAttnBackend(AttentionBackend):
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
         self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
+        # Vendored vLLM unified verify kernel (JOURNAL 12.134-12.137):
+        # env-gated experimental path for lighter depth decay. Falls back
+        # to the in-tree verify kernels on any ineligibility.
+        import os as _os
+        self.rdna_verify_enabled = (
+            _os.environ.get("SGL_RDNA_VLLM_VERIFY", "0") == "1"
+        )
+        self.rdna_verify_bufs = None
+        self.rdna_decode_bufs = None
+        self._rdna_verify_warned = False
+        self._rdna_verify_failed = False
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -220,9 +287,9 @@ class TritonAttnBackend(AttentionBackend):
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
-        # and is gfx95-only; else fall back to extend_attention_fwd.
+        # and is gated on arch (gfx95 / RDNA3); else fall back to extend_attention_fwd.
         self.use_verify_splitkv = (
-            is_gfx95_supported()
+            _verify_splitkv_arch_supported()
             and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
             and self.topk == 1
         )
@@ -475,6 +542,14 @@ class TritonAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         kv_indptr = self.kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        walk_ring, walk_rslot = record_with_ring(
+            29,
+            (self.req_to_token, kv_indices, req_pool_indices, seq_lens, kv_indptr),
+            (bs, int(kv_indices.numel()), int(seq_lens.numel())),
+            name="kv_walk",
+        )
+        if walk_ring is None:
+            walk_ring, walk_rslot = self.req_to_token, -1
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
@@ -483,7 +558,21 @@ class TritonAttnBackend(AttentionBackend):
             None,
             kv_indices,
             self.req_to_token.stride(0),
+            walk_ring,
+            walk_rslot,
         )
+        # 12.145: host-side guard — validate every walk entry BEFORE any kernel
+        # consumes it. Raises with traceback instead of faulting the GPU.
+        # NOTE: only the first seq_lens_sum entries are written (ragged
+        # over-allocation upstream is intentional); the tail must be ignored.
+        if _SGL_POOL_GUARD and bs > 0 and not torch.cuda.is_current_stream_capturing():
+            n = int(seq_lens.sum().item())
+            # Valid walk ids are [0, size] — the pool owns size+1 physical slots
+            # (0 = padding anchor, size = trailing slack); match the in-tree
+            # set_kv_buffer bound (size + page_size, page_size=1 here).
+            _guard_kv_indices(
+                kv_indices[:n], self.token_to_kv_pool.size + 1, "fill_kv_indptr"
+            )
         return kv_indptr
 
     def _update_decode_kv_buffers(
@@ -858,6 +947,10 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
+                if _SGL_POOL_GUARD and kv_indices is not None:
+                    _guard_kv_indices(
+                        kv_indices, self.token_to_kv_pool.size + 1, "spec_info"
+                    )
 
             attn_logits = torch.empty(
                 (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
@@ -1046,6 +1139,32 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.out_cache_loc
             )
 
+        rdna_de = (None, None, None, 0)
+        if (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and self.rdna_verify_enabled
+        ):
+            # Full unified walk for the rdna kernel: full_indptr =
+            # cumsum(seq_lens) as a BAKED op (graph replay recomputes
+            # from the refreshed seq_lens buffer — 12.141).
+            ext = getattr(spec_info, "extend_seq_lens_tensor", None)
+            if ext is not None:
+                ext_lens = ext[:bs].to(torch.int32)
+            else:
+                ext_lens = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            sl32 = forward_batch.seq_lens[:bs].to(torch.int32)
+            rdna_kv_lens = torch.clamp(sl32 - ext_lens, min=0)
+            rdna_full_indptr = torch.zeros(
+                bs + 1, dtype=torch.int32, device=self.device
+            )
+            torch.cumsum(sl32, 0, out=rdna_full_indptr[1:])
+            rdna_de = (
+                rdna_full_indptr,
+                rdna_kv_lens,
+                forward_batch.out_cache_loc,
+                self.num_draft_tokens,
+            )
+
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -1067,6 +1186,10 @@ class TritonAttnBackend(AttentionBackend):
             lean_Lp=lean_Lp,
             lean_Op=lean_Op,
             lean_locks=lean_locks,
+            rdna_full_kv_indptr=rdna_de[0],
+            rdna_kv_lens=rdna_de[1],
+            rdna_extend_ocl=rdna_de[2],
+            rdna_extend_ntok=rdna_de[3],
         )
 
     def init_cuda_graph_state(
@@ -1269,6 +1392,25 @@ class TritonAttnBackend(AttentionBackend):
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
         elif forward_mode.is_draft_extend_v2():
+            rdna_full_indptr = rdna_kv_lens = None
+            rdna_ocl = None
+            if self.rdna_verify_enabled:
+                # cumsum is BAKED so replay recomputes from the
+                # refreshed seq_lens graph input (12.141).
+                ext = getattr(spec_info, "extend_seq_lens_tensor", None)
+                if ext is not None:
+                    ext_lens = ext[:bs].to(torch.int32)
+                else:
+                    ext_lens = torch.zeros(
+                        bs, dtype=torch.int32, device=self.device
+                    )
+                sl32 = seq_lens[:bs].to(torch.int32)
+                rdna_kv_lens = torch.clamp(sl32 - ext_lens, min=0)
+                rdna_full_indptr = torch.zeros(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+                torch.cumsum(sl32, 0, out=rdna_full_indptr[1:])
+                rdna_ocl = out_cache_loc_full_physical
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
@@ -1293,6 +1435,10 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=None,
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
+                rdna_full_kv_indptr=rdna_full_indptr,
+                rdna_kv_lens=rdna_kv_lens,
+                rdna_extend_ocl=rdna_ocl,
+                rdna_extend_ntok=self.num_draft_tokens,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
@@ -1504,6 +1650,54 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        # Vendored vLLM unified kernel path (SGL_RDNA_VLLM_VERIFY=1).
+        # Eligibility: target-verify or draft-extend-v2 (same causal
+        # chain shape; 12.141), page_size 1, no sinks/window/score_mod,
+        # unity fp8 scales.
+        _is_de_v2 = (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and self.forward_metadata.rdna_full_kv_indptr is not None
+            and self.forward_metadata.rdna_extend_ocl is not None
+        )
+        if (
+            self.rdna_verify_enabled
+            and (
+                forward_batch.forward_mode.is_target_verify() or _is_de_v2
+            )
+            and score_mod is None
+            and sinks is None
+            and (sliding_window_size is None or sliding_window_size <= 0)
+            and self.page_size == 1
+            and causal
+            and k_descale == 1.0
+            and v_descale == 1.0
+        ):
+            try:
+                self._rdna_unified_verify(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    layer,
+                    forward_batch,
+                    kv_indptr,
+                    kv_indices,
+                    logits_soft_cap,
+                    extend_meta=(
+                        self.forward_metadata if _is_de_v2 else None
+                    ),
+                )
+                if not self._rdna_verify_warned:
+                    self._rdna_verify_warned = True
+                    logger.warning("rdna_unified_verify ACTIVE (verify path)")
+                return o
+            except Exception as _e:
+                if not self._rdna_verify_failed:
+                    self._rdna_verify_failed = True
+                    logger.warning(
+                        "rdna_unified_verify unavailable (%s); "
+                        "falling back to in-tree verify kernel.",
+                        _e,
+                    )
+
         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
         # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
@@ -1522,7 +1716,17 @@ class TritonAttnBackend(AttentionBackend):
         if (
             verify_fwd is not None
             and score_mod is None
-            and forward_batch.forward_mode.is_target_verify()
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                # DRAFT_EXTEND_V2 (topk==1) has the identical static shape
+                # (bs * num_draft_tokens rows, prefix-only kv_indptr) and the
+                # accepted chain is causal, so the split-KV kernel serves it
+                # bit-equivalently for the valid rows; graph-padded rows are
+                # garbage but unused (the eagle worker indexes by accept len).
+                # Routing it here avoids the serial extend kernel over the
+                # whole context, which costs ~25 ms/step at bs=1 / 10k ctx.
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
@@ -1578,6 +1782,130 @@ class TritonAttnBackend(AttentionBackend):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
+
+    def _rdna_unified_verify(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer,
+        forward_batch,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        logits_soft_cap: float,
+        skip_fill: bool = False,
+        extend_meta=None,
+    ) -> None:
+        """Vendored vLLM unified split-KV verify kernel (JOURNAL
+        12.134-12.137). Raises on any unsupported config; the caller
+        falls back to the in-tree verify kernel."""
+        from sglang.kernels.ops.attention.rdna_verify_adapter import (
+            RdnaVerifyBuffers,
+            rdna_verify_fwd,
+        )
+
+        meta = self.forward_metadata
+        bs = len(meta.qo_indptr) - 1
+        num_draft_tokens = self.num_draft_tokens
+        if logits_soft_cap:
+            raise ValueError("softcap unsupported in rdna_unified_verify")
+        if extend_meta is not None:
+            skip_fill = True
+            if bs > 64 or extend_meta.rdna_extend_ocl is None:
+                raise ValueError("draft-extend batch exceeds adapter sizing")
+
+        if self.rdna_verify_bufs is None:
+            self.rdna_verify_bufs = RdnaVerifyBuffers(
+                device=q.device,
+                max_bs=64,
+                max_pages=self.max_context_len + 32,
+                num_draft_tokens=num_draft_tokens,
+                h_q=q.shape[1],
+                head_dim=q.shape[2],
+                block_q=16 // (q.shape[1] // self.token_to_kv_pool.get_key_buffer(
+                    layer.layer_id
+                ).shape[1]),
+                segments=32,  # offline sweep 12.139: 292->190us @16k
+            )
+
+        if extend_meta is not None:
+            from sglang.kernels.ops.attention.rdna_verify_adapter import (
+                rdna_fill_extend,
+            )
+
+            rdna_fill_extend(
+                self.rdna_verify_bufs,
+                kv_indices,
+                meta.kv_indptr,
+                extend_meta.rdna_extend_ocl,
+                forward_batch.seq_lens,
+                bs,
+                extend_meta.rdna_extend_ntok,
+                extend_meta.rdna_full_kv_indptr,
+            )
+
+        rdna_verify_fwd(
+            q,
+            o,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            kv_indptr,
+            kv_indices,
+            forward_batch.seq_lens,
+            layer.scaling,
+            self.rdna_verify_bufs,
+            bs,
+            num_draft_tokens,
+            softcap=logits_soft_cap,
+            skip_fill=skip_fill,
+        )
+
+    def _rdna_unified_decode(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer,
+        forward_batch,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+    ) -> None:
+        """Decode twin of _rdna_unified_verify: MLE=1, one token per
+        sequence. Serves target decode and the EAGLE draft's per-step
+        decode (long-context draft attention was the next depth-decay
+        driver after verify — JOURNAL 12.138)."""
+        from sglang.kernels.ops.attention.rdna_verify_adapter import (
+            RdnaVerifyBuffers,
+            rdna_verify_fwd,
+        )
+
+        bs = q.shape[0]
+        if bs > 64:
+            raise ValueError(f"decode bs {bs} exceeds adapter sizing")
+        if self.rdna_decode_bufs is None:
+            key_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            self.rdna_decode_bufs = RdnaVerifyBuffers(
+                device=q.device,
+                max_bs=64,
+                max_pages=self.max_context_len + 32,
+                num_draft_tokens=1,
+                h_q=q.shape[1],
+                head_dim=q.shape[2],
+                block_q=16 // (q.shape[1] // key_buf.shape[1]),
+                segments=64,  # offline sweep 12.139: 243->108us @16k
+            )
+
+        rdna_verify_fwd(
+            q,
+            o,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            kv_indptr,
+            kv_indices,
+            forward_batch.seq_lens,
+            layer.scaling,
+            self.rdna_decode_bufs,
+            bs,
+            1,
+        )
 
     def _forward_extend_dcp(
         self,
@@ -1945,6 +2273,45 @@ class TritonAttnBackend(AttentionBackend):
         else:
             k_descale = 1.0
             v_descale = 1.0
+
+        # Vendored vLLM unified kernel, decode path (JOURNAL 12.138):
+        # covers target decode AND the EAGLE draft's per-step decode
+        # (the draft backends delegate here with per-step metadata).
+        # The draft's grouped stage1 kernel is the same latency-
+        # serialized Triton family we replaced for verify (~611us/launch
+        # at 11k, growing with context).
+        if (
+            self.rdna_verify_enabled
+            and forward_batch.forward_mode.is_decode()
+            and sinks is None
+            and score_mod is None
+            and self.page_size == 1
+            and k_descale == 1.0
+            and v_descale == 1.0
+            and layer.qk_head_dim == layer.v_head_dim
+            and kv_indices is not None
+        ):
+            try:
+                self._rdna_unified_decode(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    layer,
+                    forward_batch,
+                    kv_indptr,
+                    kv_indices,
+                )
+                if not self._rdna_verify_warned:
+                    self._rdna_verify_warned = True
+                    logger.warning("rdna_unified_verify ACTIVE (decode path)")
+                return o
+            except Exception as _e:
+                if not self._rdna_verify_failed:
+                    self._rdna_verify_failed = True
+                    logger.warning(
+                        "rdna_unified_verify decode unavailable (%s); "
+                        "falling back to in-tree decode kernel.",
+                        _e,
+                    )
 
         # Select the correctly-sized attn_logits buffer for this layer.
         # The triton kernel's // Lv stride trick requires attn_logits.shape[-1]

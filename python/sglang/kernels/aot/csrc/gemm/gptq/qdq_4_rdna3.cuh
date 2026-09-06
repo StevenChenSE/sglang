@@ -55,27 +55,32 @@ __forceinline__ __device__ void shuffle_4bit_8(uint32_t* q) {
 // fp16 path
 // ---------------------------------------------------------------------------
 
-// Numerics: exact integer subtraction first ((1024+q) - (1024+zero) = q - zero)
-// followed by multiplication with scale. This avoids rounding intermediate
-// offsets to fp16 before FMA and produces bit-identical weights to the WMMA
-// kernel.
+// Precompute scale-baked constants for a single zero/scale pair.
+//   z1z16[0] = scale * (-1024 - zero)            (used for "low" pairs)
+//   z1z16[1] = scale * (-64   - zero)            (used for "high" pairs)
+//   y1y16[0] = scale * 1                          (low pairs are q + 1024)
+//   y1y16[1] = scale * (1/16)                     (high pairs are q*16 + 1024)
 __forceinline__ __device__ void prep_zero_scale_fp16(uint32_t zero, half scale,
-                                                     half2& z_prep,
-                                                     half2& y_prep) {
+                                                     half2 (&z1z16)[2],
+                                                     half2 (&y1y16)[2]) {
+  // half(-1024 - zero) via the exllamav2 bit-trick:
+  //   half bits 0xE400 == -1024.0 ; ORing the zero into mantissa subtracts it.
   union {
     uint16_t u;
     half h;
-  } zu;
-  zu.u = (uint16_t)(0x6400 | zero);
-  z_prep = __half2half2(zu.h);
-  y_prep = __half2half2(scale);
-}
+  } z1u;
+  z1u.u = (uint16_t)(0xE400 | zero);
+  half z1 = z1u.h;
+  half z16 = __hsub(__int2half_rn(-64), __int2half_rn((int)zero));
 
-__forceinline__ __device__ void prep_zero_scale_fp16_precise(uint32_t zero,
-                                                             half scale,
-                                                             half2& z_prep,
-                                                             half2& y_prep) {
-  prep_zero_scale_fp16(zero, scale, z_prep, y_prep);
+  half2 scale2 = __half2half2(scale);
+  z1z16[0] = __hmul2(scale2, __half2half2(z1));
+  z1z16[1] = __hmul2(scale2, __half2half2(z16));
+
+  half y1 = __float2half_rn(1.0f);
+  half y16 = __float2half_rn(1.0f / 16.0f);
+  y1y16[0] = __hmul2(scale2, __half2half2(y1));
+  y1y16[1] = __hmul2(scale2, __half2half2(y16));
 }
 
 // Dequantize one int32 (8 shuffled 4-bit weights) into 4 half2 pairs:
@@ -84,30 +89,72 @@ __forceinline__ __device__ void prep_zero_scale_fp16_precise(uint32_t zero,
 //   dq[2] = (q[4], q[5]) * scale - zero*scale
 //   dq[3] = (q[6], q[7]) * scale - zero*scale
 __forceinline__ __device__ void dequant_4bit_8_fp16(uint32_t qa, half2 (&dq)[4],
-                                                    half2 z_prep,
-                                                    half2 y_prep) {
+                                                    half2 (&z1z16)[2],
+                                                    half2 (&y1y16)[2]) {
   const uint32_t c0 = 0x64006400;
 
   union {
     uint32_t u;
     half2 h2;
   } q0, q1, q2, q3;
-  q0.u = ((qa >> 0) & 0x000F000F) | c0;
-  q1.u = ((qa >> 4) & 0x000F000F) | c0;
-  q2.u = ((qa >> 8) & 0x000F000F) | c0;
-  q3.u = ((qa >> 12) & 0x000F000F) | c0;
+  q0.u = (qa & 0x000F000F) | c0;  // half2(q[0]+1024, q[1]+1024)
+  q1.u = (qa & 0x00F000F0) | c0;  // half2(q[2]*16+1024, q[3]*16+1024)
+  uint32_t qa_hi = qa >> 8;
+  q2.u = (qa_hi & 0x000F000F) | c0;  // half2(q[4]+1024, q[5]+1024)
+  q3.u = (qa_hi & 0x00F000F0) | c0;  // half2(q[6]*16+1024, q[7]*16+1024)
 
-  dq[0] = __hmul2(__hsub2(q0.h2, z_prep), y_prep);
-  dq[1] = __hmul2(__hsub2(q1.h2, z_prep), y_prep);
-  dq[2] = __hmul2(__hsub2(q2.h2, z_prep), y_prep);
-  dq[3] = __hmul2(__hsub2(q3.h2, z_prep), y_prep);
+  dq[0] = __hfma2(q0.h2, y1y16[0], z1z16[0]);
+  dq[1] = __hfma2(q1.h2, y1y16[1], z1z16[1]);
+  dq[2] = __hfma2(q2.h2, y1y16[0], z1z16[0]);
+  dq[3] = __hfma2(q3.h2, y1y16[1], z1z16[1]);
 }
 
-__forceinline__ __device__ void dequant_4bit_8_fp16_precise(uint32_t qa,
-                                                            half2 (&dq)[4],
-                                                            half2 z_prep,
-                                                            half2 y_prep) {
-  dequant_4bit_8_fp16(qa, dq, z_prep, y_prep);
+// ---------------------------------------------------------------------------
+// bf16 path
+// ---------------------------------------------------------------------------
+
+// Bit-trick magic for bf16:
+//   bf16(128) == 0x4300 (sign 0, exp 134, mantissa 0).
+//   For nibble n in [0..15], bits [3:0] of mantissa hold n exactly because
+//   bf16's ULP at 128 is 1 (mantissa step = 2^(7-7) = 1). So
+//   ((qa & 0x000F000F) | 0x43004300) bitcasts to bfloat162(128+n_lo, 128+n_hi).
+//
+// Because bf16's mantissa is only 7 bits, we cannot use the fp16 "upper nibble
+// * 16" trick. Instead each pair of nibbles is shifted down to [3:0]/[19:16]
+// via a single 4/8/12-bit right-shift before the OR. That costs one extra
+// shift per pair vs fp16, but keeps the FMA structure identical.
+__forceinline__ __device__ void prep_zero_scale_bf16(uint32_t zero,
+                                                     bf16_t scale,
+                                                     bf162_t& z_prep,
+                                                     bf162_t& y_prep) {
+  // z = scale * -(128 + zero); y = scale.
+  float scale_f = __bfloat162float(scale);
+  float zf = -(128.0f + (float)zero) * scale_f;
+  bf16_t zb = __float2bfloat16(zf);
+  z_prep = __bfloat162bfloat162(zb);
+  y_prep = __bfloat162bfloat162(scale);
+}
+
+__forceinline__ __device__ void dequant_4bit_8_bf16(uint32_t qa,
+                                                    bf162_t (&dq)[4],
+                                                    bf162_t z_prep,
+                                                    bf162_t y_prep) {
+  const uint32_t c0 = 0x43004300;
+
+  union {
+    uint32_t u;
+    bf162_t b2;
+  } q0, q1, q2, q3;
+  q0.u = ((qa >> 0) & 0x000F000F) | c0;   // bf162(128+q[0], 128+q[1])
+  q1.u = ((qa >> 4) & 0x000F000F) | c0;   // bf162(128+q[2], 128+q[3])
+  q2.u = ((qa >> 8) & 0x000F000F) | c0;   // bf162(128+q[4], 128+q[5])
+  q3.u = ((qa >> 12) & 0x000F000F) | c0;  // bf162(128+q[6], 128+q[7])
+
+  // dq = q_b * scale + (-(128+zero)*scale) = (q - zero) * scale
+  dq[0] = __hfma2(q0.b2, y_prep, z_prep);
+  dq[1] = __hfma2(q1.b2, y_prep, z_prep);
+  dq[2] = __hfma2(q2.b2, y_prep, z_prep);
+  dq[3] = __hfma2(q3.b2, y_prep, z_prep);
 }
 
 // ---------------------------------------------------------------------------

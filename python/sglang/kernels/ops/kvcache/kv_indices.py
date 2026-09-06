@@ -14,9 +14,16 @@ def create_flashinfer_kv_indices_triton(
     kv_start_idx,
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
+    rec_ring=None,
+    rec_slot=-1,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
+
+    if rec_ring:
+        if rec_slot >= 0:
+            if pid == 0:
+                tl.store(rec_ring + rec_slot * 32 + 24, 1)
 
     # find the req pool idx, this is for batch to token
     req_pool_index = tl.load(req_pool_indices_ptr + pid)
@@ -42,6 +49,11 @@ def create_flashinfer_kv_indices_triton(
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+
+    if rec_ring:
+        if rec_slot >= 0:
+            if pid == 0:
+                tl.store(rec_ring + rec_slot * 32 + 25, 1)
 
 
 @triton.jit

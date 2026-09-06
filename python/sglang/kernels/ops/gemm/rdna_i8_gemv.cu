@@ -1,0 +1,109 @@
+// v3: M<=4 support, explicit wave32, 4-row groups, m-pair x registers.
+// out[m,n] = scale[n] * sum_k x[m,k]*W8[n,k]. JOURNAL 12.103.
+#include <torch/extension.h>
+#include <hip/hip_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#define WAVES 16
+#define THREADS (WAVES * 32)
+
+__global__ void __launch_bounds__(THREADS)
+i8_gemv_v3(const __half* __restrict__ x,   // [M, K] fp16
+           const int8_t* __restrict__ w8,  // [N, K]
+           const __half* __restrict__ scale, // [N]
+           __half* __restrict__ out,       // [M, N]
+           int M, int N, int K) {
+  HIP_DYNAMIC_SHARED(__half, xs)  // [M][K] dynamic — real head K=5120
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+
+  for (int m = 0; m < M; ++m)
+    for (int k = tid; k < K; k += THREADS) xs[(size_t)m * K + k] = x[m * K + k];
+  __syncthreads();
+
+  int ngroups = N >> 2;
+  int kpass_end = (K >> 9) << 9;
+  for (int g = blockIdx.x * WAVES + warp; g < ngroups; g += gridDim.x * WAVES) {
+    int n0 = g << 2;
+    float acc[4][4];  // [m][row]
+    #pragma unroll
+    for (int m = 0; m < 4; ++m)
+      #pragma unroll
+      for (int r = 0; r < 4; ++r) acc[m][r] = 0.f;
+    const int8_t* wr[4];
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) wr[r] = w8 + (size_t)(n0 + r) * K;
+    int k0 = lane << 4;
+    for (; k0 + 16 <= kpass_end; k0 += 512) {
+      // m-pairs: load x[m-pair] chunk once, apply to 4 weight rows
+      #pragma unroll
+      for (int mp = 0; mp < 4; mp += 2) {
+        float xa[16], xb[16];
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          xa[j] = __half2float(xs[(size_t)mp * K + k0 + j]);
+          xb[j] = __half2float(xs[(size_t)(mp + 1) * K + k0 + j]);
+        }
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          uint4 wv = *reinterpret_cast<const uint4*>(wr[r] + k0);
+          const int8_t* wb = reinterpret_cast<const int8_t*>(&wv);
+          #pragma unroll
+          for (int j = 0; j < 16; ++j) {
+            float w = (float)wb[j];
+            acc[mp][r] += w * xa[j];
+            acc[mp + 1][r] += w * xb[j];
+          }
+        }
+      }
+    }
+    if (K & 511) {
+      for (int k = kpass_end + lane; k < K; k += 32) {
+        #pragma unroll
+        for (int mp = 0; mp < 4; mp += 2) {
+          float wa = __half2float(xs[(size_t)mp * K + k]), wb2 = __half2float(xs[(size_t)(mp + 1) * K + k]);
+          #pragma unroll
+          for (int r = 0; r < 4; ++r) {
+            float w = (float)wr[r][k];
+            acc[mp][r] += w * wa;
+            acc[mp + 1][r] += w * wb2;
+          }
+        }
+      }
+    }
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      float sc = __half2float(scale[n0 + r]);
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) acc[m][r] += __shfl_down(acc[m][r], off, 32);
+      if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < 4; ++m)
+          if (m < M) out[(size_t)m * N + n0 + r] = __float2half(acc[m][r] * sc);
+      }
+    }
+  }
+}
+
+torch::Tensor i8_gemv(torch::Tensor x, torch::Tensor w8, torch::Tensor scale) {
+  int M = x.size(0), K = x.size(1), N = w8.size(0);
+  TORCH_CHECK(M >= 1 && M <= 4 && K <= 5760 && (N & 3) == 0, "unsupported shape");
+  auto out = torch::empty({M, N}, torch::dtype(torch::kFloat16).device(x.device()));
+  int grid = std::min(((N >> 2) + WAVES - 1) / WAVES, 132 * 12);
+  size_t smem = (size_t)M * K * sizeof(__half);
+  // JOURNAL 12.104: launch on the CURRENT torch stream — a null-stream launch
+  // is NOT captured by cuda-graph capture, so graph replays served stale
+  // logits (live accept len collapsed to 1.00 with correct offline numerics).
+  hipStream_t stream = at::cuda::getCurrentHIPStream();
+  hipLaunchKernelGGL(i8_gemv_v3, dim3(grid), dim3(THREADS), smem, stream,
+      reinterpret_cast<const __half*>(x.data_ptr()),
+      w8.data_ptr<int8_t>(),
+      reinterpret_cast<const __half*>(scale.data_ptr()),
+      reinterpret_cast<__half*>(out.data_ptr()), M, N, K);
+  return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("i8_gemv", &i8_gemv); }

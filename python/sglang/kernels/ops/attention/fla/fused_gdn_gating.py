@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.flight_recorder import record_with_ring
+
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 # beta_output = b.sigmoid()
@@ -18,12 +20,17 @@ def fused_gdn_gating_kernel(
     seq_len,
     stride_a,
     stride_b,
+    rec_ring,
+    rec_slot,
     NUM_HEADS: tl.constexpr,
     beta: tl.constexpr,
     threshold: tl.constexpr,
     BLK_HEADS: tl.constexpr,
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if rec_slot >= 0:
+        if (i_b == 0) and (i_s == 0) and (i_d == 0):
+            tl.store(rec_ring + rec_slot * 32 + 24, 1)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
     off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
@@ -39,6 +46,9 @@ def fused_gdn_gating_kernel(
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
     tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
+    if rec_slot >= 0:
+        if (i_b == 0) and (i_s == 0) and (i_d == 0):
+            tl.store(rec_ring + rec_slot * 32 + 25, 1)
 
 
 def fused_gdn_gating(
@@ -56,6 +66,11 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
+    ring, rslot = record_with_ring(
+        37, (g, beta_output, A_log, a, b, dt_bias), (batch, num_heads), name="gdn_gating"
+    )
+    if ring is None:
+        ring, rslot = a, -1
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,
@@ -66,6 +81,8 @@ def fused_gdn_gating(
         seq_len,
         stride_a,
         stride_b,
+        ring,
+        rslot,
         num_heads,
         beta,
         threshold,

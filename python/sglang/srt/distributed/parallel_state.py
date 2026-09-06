@@ -501,6 +501,119 @@ class GroupCoordinator:
         elif self.world_size > 1 and is_hip():
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
+        # 12.116 real-timing probe: run the full custom-AR init sequence
+        # (meta, rank_data, ctor with dummy handles — peer opens gated off by
+        # SGL_RDNA_SKIP_META_IPC) at the REAL post-NCCL timing even when
+        # --disable-custom-all-reduce is set. Discriminates "the ctor at real
+        # timing poisons the run" from "the ca_comm wiring is the poison".
+        if (
+            is_hip()
+            and self.world_size > 1
+            and os.environ.get("SGL_RDNA_REALTIME_PROBE", "0") in ("1", "2", "3")
+            and self.ca_comm is None
+        ):
+            try:
+                from sglang.srt.distributed.device_communicators import (
+                    custom_all_reduce_ops as _probe_ops,
+                )
+
+                _probe_meta = _probe_ops.allocate_meta_buffer(
+                    _probe_ops.meta_size() + 16 * 1024 * 1024
+                )
+                # 12.117 L3: LOCAL hipIpcGetMemHandle on the uncached meta
+                # buffer at REAL (post-NCCL) timing — the only real-init step
+                # every corrupt boot runs and no healthy boot does.
+                _probe_local_handle = None
+                if os.environ.get("SGL_RDNA_REALTIME_PROBE") == "3":
+                    _probe_local_handle = _probe_ops.get_meta_buffer_ipc_handle(
+                        _probe_meta
+                    )
+                # 12.118: SGL_RDNA_PROBE_REAL=1 — replicate the FULL real-init
+                # sequence with REAL handles (gloo gather, real ctor opens,
+                # real reg registration) but NO CustomAllreduce instance.
+                # Isolates real-handle init work from the python object.
+                if os.environ.get("SGL_RDNA_PROBE_REAL") == "1":
+                    _probe_lh = _probe_ops.get_meta_buffer_ipc_handle(_probe_meta)
+                    _probe_shard = (bytes(_probe_lh), 0)
+                    _probe_parts = [[None, None] for _ in range(self.world_size)]
+                    _probe_parts[self.rank] = _probe_shard
+                    import torch.distributed as _td
+                    for _i, _r in enumerate(
+                        sorted(
+                            _td.get_process_group_ranks(group=self.cpu_group)
+                        )
+                    ):
+                        _td.broadcast_object_list(
+                            _probe_parts[_i],
+                            src=_r,
+                            group=self.cpu_group,
+                            device="cpu",
+                        )
+                    _probe_handles = [
+                        _p[0] for _p in _probe_parts
+                    ]
+                    _probe_offsets = [_p[1] for _p in _probe_parts]
+                    logger.warning(
+                        "[rdna_ar] PROBE_REAL: real-handle init (gather done)"
+                    )
+                _probe_rank_data = torch.empty(
+                    16 * 1024 * 1024, dtype=torch.uint8, device=self.device
+                )
+                # PROBE_REAL: use the REAL gathered handles/offsets instead
+                # of dummies (real hipIpcOpenMemHandle peer mappings in the
+                # ctor), and keep refs alive like the real class does.
+                if os.environ.get("SGL_RDNA_PROBE_REAL") != "1":
+                    _probe_handles = [b"\0" * 64 for _ in range(self.world_size)]
+                    _probe_offsets = [0] * self.world_size
+                # mirror the real init: _RDNA_CUSTOM_AR forces full_nvlink=False
+                _probe_fnv = (
+                    os.environ.get("SGL_RDNA_PROBE_FNV", "1") == "1"
+                )
+                _RDNA_PROBE_FA = _probe_ops.init_custom_ar(
+                    _probe_meta, _probe_rank_data, _probe_handles,
+                    _probe_offsets, self.rank, _probe_fnv,
+                )
+                # stage 2: ALSO allocate the uncached reg buffer at real
+                # timing (hipExtMallocWithFlags AFTER NCCL comm creation).
+                if int(os.environ.get("SGL_RDNA_REALTIME_PROBE", "0")) >= 2:
+                    _RDNA_PROBE_REG2 = _probe_ops.allocate_reg_buffer(
+                        16 * 1024 * 1024
+                    )
+                    if os.environ.get("SGL_RDNA_PROBE_REAL") == "1":
+                        # real reg IPC registration (peer opens the reg buf)
+                        _reg_lh = _probe_ops.get_meta_buffer_ipc_handle(
+                            _RDNA_PROBE_REG2
+                        )
+                        _reg_parts = [[None, None] for _ in range(self.world_size)]
+                        _reg_parts[self.rank] = (bytes(_reg_lh), 0)
+                        import torch.distributed as _td2
+                        for _i, _r in enumerate(
+                            sorted(
+                                _td2.get_process_group_ranks(group=self.cpu_group)
+                            )
+                        ):
+                            _td2.broadcast_object_list(
+                                _reg_parts[_i],
+                                src=_r,
+                                group=self.cpu_group,
+                                device="cpu",
+                            )
+                        _probe_ops.register_buffer(
+                            _RDNA_PROBE_FA,
+                            _RDNA_PROBE_REG2,
+                            [_p[0] for _p in _reg_parts],
+                            [_p[1] for _p in _reg_parts],
+                        )
+                        logger.warning(
+                            "[rdna_ar] PROBE_REAL: reg buffer registered"
+                        )
+                logger.warning(
+                    "[rdna_ar] REALTIME probe: full init sequence ran at "
+                    "real timing (ctor only, no execution)"
+                )
+            except Exception as e:
+                logger.warning(f"[rdna_ar] REALTIME probe failed: {e}")
+
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
             self.torch_symm_mem_comm = TorchSymmMemCommunicator(
@@ -916,6 +1029,14 @@ class GroupCoordinator:
         input_: torch.Tensor,
         should_use_pymscclpp_allreduce: Optional[bool] = None,
     ) -> Optional[str]:
+        # 12.117: SGLANG_FORCE_PYNCCL=1 routes every out-of-graph AR through
+        # pynccl (outplace) instead of torch.distributed.all_reduce — tests
+        # whether the eager-path corruption is the collective backend.
+        if (
+            os.environ.get("SGLANG_FORCE_PYNCCL") == "1"
+            and self.pynccl_comm is not None
+        ):
+            return "pynccl"
         if should_use_pymscclpp_allreduce is None:
             should_use_pymscclpp_allreduce = (
                 self.pymscclpp_comm is not None
@@ -1012,6 +1133,32 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)
+            # 12.117: verify the pynccl AR payload cross-rank (eager calls
+            # only — capture-time calls are skipped; the device-side counter
+            # idea doesn't apply here). Heartbeat+MISMATCH via logger.
+            if (
+                os.environ.get("SGLANG_PYNCCL_CHECKSUM") == "1"
+                and not input_.numel() % 16
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                _cksum_n = getattr(self, "_pynccl_cksum_n", 0) + 1
+                self._pynccl_cksum_n = _cksum_n
+                if _cksum_n % 32 == 0:
+                    in_s = float(input_.float().sum().item())
+                    out_s = float(out.float().sum().item())
+                    parts = [None] * self.world_size
+                    torch.distributed.all_gather_object(
+                        parts, in_s, group=self.cpu_group
+                    )
+                    expected = float(sum(float(p) for p in parts))
+                    bad = abs(out_s - expected) > max(1.0, 0.02 * abs(expected))
+                    if bad or (_cksum_n // 32) % 8 == 0:
+                        logger.warning(
+                            f"[PYNCCL-CKSUM] rank={self.rank} call={_cksum_n} "
+                            f"shape={tuple(input_.shape)} out_sum={out_s:.6e} "
+                            f"expected={expected:.6e} "
+                            f"{'MISMATCH' if bad else 'ok'}"
+                        )
         assert out is not None
         return out
 
@@ -1027,6 +1174,12 @@ class GroupCoordinator:
         ):
             torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
+            # 12.118: SGLANG_TORCHDIST_SYNC=1 — explicit device sync before
+            # the torch.distributed collective. If eager corruption is a
+            # missing stream-sync race in the torch NCCL PG on ROCm, this
+            # heals it.
+            if os.environ.get("SGLANG_TORCHDIST_SYNC") == "1":
+                torch.cuda.synchronize()
             torch.distributed.all_reduce(input_, group=self.device_group)
 
     def reduce_scatter_along_dim(
@@ -1245,6 +1398,10 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
         else:
+            # 12.118: same race-fix as _all_reduce_in_place — the logits
+            # all_gather rides the torch PG here in every config.
+            if os.environ.get("SGLANG_TORCHDIST_SYNC") == "1":
+                torch.cuda.synchronize()
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
             )

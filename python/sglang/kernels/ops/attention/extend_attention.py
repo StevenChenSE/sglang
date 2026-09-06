@@ -19,6 +19,10 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 import torch
 import triton
 import triton.language as tl
+from sglang.kernels.ops.attention.fla.flight_recorder import record as flight_record
+from sglang.kernels.ops.attention.fla.flight_recorder import record_with_ring as flight_record_with_ring
+
+from sglang.kernels.ops.attention.fla.utils import get_witness
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import (
@@ -323,6 +327,10 @@ def _fwd_kernel(
     mask_indptr,
     sink_ptr,
     window_kv_offset_ptr,
+    witness,
+    rec_ring,
+    rec_slot,
+    num_kv_indices,
     sm_scale,
     k_scale,
     v_scale,
@@ -373,6 +381,9 @@ def _fwd_kernel(
     aux0_stride_h=0,
     aux0_len=0,
 ):
+    if rec_slot >= 0:
+        if (tl.program_id(0) == 0) and (tl.program_id(1) == 0):
+            tl.store(rec_ring + rec_slot * 32 + 24, 1)
     if USE_COMPACT_TILE_GRID:
         output_tile = tl.program_id(0)
         cur_head = tl.program_id(1)
@@ -407,6 +418,16 @@ def _fwd_kernel(
     cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
     cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
     cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
+    if not (
+        (cur_seq_kv_start_idx >= 0)
+        & (cur_seq_len_prefix >= 0)
+        & (cur_seq_kv_start_idx + cur_seq_len_prefix <= num_kv_indices)
+        & (cur_seq_len_extend >= 0)
+    ):
+        tl.store(witness + 0, 11)
+        tl.store(witness + 1, cur_seq_kv_start_idx)
+        tl.store(witness + 2, cur_seq_len_prefix)
+        return
 
     # Grid axis 2 spans the batch-max extend length; all stores are masked by mask_m.
     if cur_block_m * BLOCK_M >= cur_seq_len_extend:
@@ -773,6 +794,10 @@ def _fwd_kernel(
             mask=mask_m[:, None] & mask_dv[None, :],
         )
 
+    if rec_slot >= 0:
+        if (tl.program_id(0) == 0) and (tl.program_id(1) == 0):
+            tl.store(rec_ring + rec_slot * 32 + 25, 1)
+
 
 def extend_attention_fwd(
     q_extend,
@@ -878,6 +903,10 @@ def extend_attention_fwd(
         score_mod, aux_tensors
     )
 
+    
+    flight_ring, flight_rslot = flight_record_with_ring(31, (q_extend, k_buffer, v_buffer, o_extend, kv_indices, qo_indptr, kv_indptr), (q_extend.shape[0], batch_size, max_len_extend), name="extend_attention")
+    if flight_ring is None:
+        flight_ring, flight_rslot = q_extend, -1
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -893,6 +922,10 @@ def extend_attention_fwd(
         mask_indptr,
         sinks,
         window_kv_offsets,
+        get_witness(q_extend.device),
+        flight_ring,
+        flight_rslot,
+        kv_indices.numel(),
         sm_scale,
         k_scale,
         v_scale,

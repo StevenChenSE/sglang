@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.flight_recorder import record, record_with_ring
+
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import is_hip
 
@@ -383,6 +385,8 @@ def _fused_sigmoid_mul_kernel(
     gate_ptr,
     gate_stride_row,
     gate_stride_head,
+    rec_ring,
+    rec_slot,
     hidden_dim: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -390,6 +394,10 @@ def _fused_sigmoid_mul_kernel(
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
     pid_block = tl.program_id(1)
+
+    if rec_slot >= 0:
+        if (pid_row == 0) and (pid_block == 0):
+            tl.store(rec_ring + rec_slot * 32 + 24, 1)
 
     offsets = pid_block * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offsets < hidden_dim
@@ -404,6 +412,10 @@ def _fused_sigmoid_mul_kernel(
 
     result = attn * tl.sigmoid(g)
     tl.store(output_ptr + attn_off, result, mask=mask)
+
+    if rec_slot >= 0:
+        if (pid_row == 0) and (pid_block == 0):
+            tl.store(rec_ring + rec_slot * 32 + 25, 1)
 
 
 def fused_sigmoid_mul(
@@ -446,12 +458,19 @@ def fused_sigmoid_mul(
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
+    ring, rslot = record_with_ring(
+        32, (attn_output, gate, out), (num_tokens, hidden_dim), name="fused_sigmoid_mul"
+    )
+    if ring is None:
+        ring, rslot = attn_output, -1
     _fused_sigmoid_mul_kernel[grid](
         out,
         attn_output,
         gate,
         gate_stride_row,
         gate_stride_head,
+        ring,
+        rslot,
         hidden_dim,
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,

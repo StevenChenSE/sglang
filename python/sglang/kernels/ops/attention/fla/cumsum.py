@@ -9,7 +9,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
-from sglang.kernels.ops.attention.fla.utils import check_shared_mem, input_guard
+from sglang.kernels.ops.attention.fla.flight_recorder import record, record_with_ring
+from sglang.kernels.ops.attention.fla.utils import (
+    check_shared_mem,
+    get_witness,
+    input_guard,
+)
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -25,6 +30,8 @@ def chunk_local_cumsum_scalar_kernel(
     scale,
     cu_seqlens,
     chunk_indices,
+    num_seqs,
+    witness,
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -33,9 +40,15 @@ def chunk_local_cumsum_scalar_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    rec_ring=None,
+    rec_slot=-1,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    if rec_ring:
+        if rec_slot >= 0:
+            if (i_t == 0) and (i_bh == 0):
+                tl.store(rec_ring + rec_slot * 32 + 24, 1)
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
             chunk_indices + i_t * 2 + 1
@@ -43,6 +56,13 @@ def chunk_local_cumsum_scalar_kernel(
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
         ).to(tl.int32)
+        if not (
+            (i_n >= 0) & (i_n < num_seqs) & (bos >= 0) & (bos <= eos) & (eos <= T)
+        ):
+            tl.store(witness + 0, 5)
+            tl.store(witness + 1, i_n)
+            tl.store(witness + 2, bos)
+            return
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -67,6 +87,11 @@ def chunk_local_cumsum_scalar_kernel(
         b_o *= scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
+    if rec_ring:
+        if rec_slot >= 0:
+            if (i_t == 0) and (i_bh == 0):
+                tl.store(rec_ring + rec_slot * 32 + 25, 1)
+
 
 @triton.autotune(
     configs=[
@@ -84,6 +109,8 @@ def chunk_local_cumsum_vector_kernel(
     scale,
     cu_seqlens,
     chunk_indices,
+    num_seqs,
+    witness,
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -94,9 +121,15 @@ def chunk_local_cumsum_vector_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    rec_ring=None,
+    rec_slot=-1,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
+    if rec_ring:
+        if rec_slot >= 0:
+            if (i_s == 0) and (i_t == 0) and (i_bh == 0):
+                tl.store(rec_ring + rec_slot * 32 + 24, 1)
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
             chunk_indices + i_t * 2 + 1
@@ -104,6 +137,13 @@ def chunk_local_cumsum_vector_kernel(
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
         ).to(tl.int32)
+        if not (
+            (i_n >= 0) & (i_n < num_seqs) & (bos >= 0) & (bos <= eos) & (eos <= T)
+        ):
+            tl.store(witness + 0, 6)
+            tl.store(witness + 1, i_n)
+            tl.store(witness + 2, bos)
+            return
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -155,6 +195,11 @@ def chunk_local_cumsum_vector_kernel(
         b_o *= scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
+    if rec_ring:
+        if rec_slot >= 0:
+            if (i_s == 0) and (i_t == 0) and (i_bh == 0):
+                tl.store(rec_ring + rec_slot * 32 + 25, 1)
+
 
 def chunk_local_cumsum_scalar(
     g: torch.Tensor,
@@ -179,12 +224,19 @@ def chunk_local_cumsum_scalar(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
+    ring, rslot = record_with_ring(20, (g_org, g, cu_seqlens, chunk_indices), (T, B), name="cumsum_scalar")
+    if ring is None:
+        ring, rslot = g_org, -1
     chunk_local_cumsum_scalar_kernel[grid](
         s=g_org,
         o=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        num_seqs=(len(cu_seqlens) - 1 if cu_seqlens is not None else B),
+        witness=get_witness(g.device),
+        rec_ring=ring,
+        rec_slot=rslot,
         T=T,
         B=B,
         H=H,
@@ -229,12 +281,19 @@ def chunk_local_cumsum_vector(
     # keep cumulative normalizer in fp32
     # this kernel is equivalent to
     # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
+    ring, rslot = record_with_ring(21, (g_org, g, cu_seqlens, chunk_indices), (T, B), name="cumsum_vector")
+    if ring is None:
+        ring, rslot = g_org, -1
     chunk_local_cumsum_vector_kernel[grid](
         s=g_org,
         o=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        num_seqs=(len(cu_seqlens) - 1 if cu_seqlens is not None else B),
+        witness=get_witness(g.device),
+        rec_ring=ring,
+        rec_slot=rslot,
         T=T,
         B=B,
         H=H,

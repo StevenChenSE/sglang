@@ -66,6 +66,7 @@ sources = [
     "csrc/elementwise/pos_enc.cu",
     "csrc/quantization/gguf/gguf_kernel.cu",
     "csrc/gemm/gptq/gptq_kernel.cu",
+    "csrc/gemm/wv_skinny_gemms.cu",
     "csrc/gemm/gptq/q_gemm_rdna3.cu",
     "csrc/gemm/gptq/q_gemm_rdna3_wmma.cu",
     "csrc/gemm/gptq/moe_q_gemm_rdna3.cu",
@@ -126,6 +127,13 @@ hipcc_flags = [
     "-DENABLE_FP8",
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
+    # Match the vLLM fork's HIP profile: torch's COMMON_HIPCC_FLAGS defines
+    # __HIP_NO_HALF_OPERATORS__/__HIP_NO_HALF_CONVERSIONS__, which disables the
+    # half/bf16 operator overloads and measurably degrades the gptq RDNA3
+    # kernels' codegen. vLLM undefines both (-U after -D wins); do the same.
+    # Flags appended here come AFTER torch's -D on the hipcc command line.
+    "-U__HIP_NO_HALF_OPERATORS__",
+    "-U__HIP_NO_HALF_CONVERSIONS__",
 ]
 
 # On RDNA the CDNA-only all-reduce collectives are not built; guard their

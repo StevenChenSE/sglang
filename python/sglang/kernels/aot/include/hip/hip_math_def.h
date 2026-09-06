@@ -89,10 +89,15 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 }
 
 // operator overload to support flashinfer
+// Only needed when __HIP_NO_HALF_OPERATORS__ is defined (built-in __half
+// operators disabled). With the vLLM-matched -U flag profile, hip_fp16.h
+// provides these operators itself and a second definition collides.
+#ifdef __HIP_NO_HALF_OPERATORS__
 __host__ __device__ __forceinline__ __half operator*(const __half& x, const __half& y) {
   __half h_x = x;
   __half h_y = y;
   return __hmul(h_x, h_y);
 }
+#endif
 
 #endif

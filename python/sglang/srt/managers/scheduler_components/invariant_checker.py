@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
+import traceback
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
@@ -57,6 +60,7 @@ class SchedulerInvariantChecker:
     get_running_batch: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
+    mamba_leak_strikes: int = 0
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -283,6 +287,13 @@ class SchedulerInvariantChecker:
         swa_leak, swa_msg = False, ""
         if self.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
+
+        # NOTE: the mamba identity (available+evictable+protected+session_held
+        # == size) is NOT busy-safe: session_held does not count slots held by
+        # running requests (active + ping-pong track slots), and a finished
+        # request's slots sit in a lazy-return limbo until the next boundary
+        # reclaim. It is only meaningful in the idle path (_check_all_pools),
+        # where the pool has settled.
 
         level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
         full_line = f"[Mem Check (BUSY)] {full_msg}"

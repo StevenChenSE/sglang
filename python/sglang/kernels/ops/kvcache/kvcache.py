@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.fla.flight_recorder import record
+
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -98,6 +100,7 @@ def store_cache(
             num_split = 1
     if size_limit <= 0:
         size_limit = k_cache.shape[0]
+    record(30, (k, v, k_cache, v_cache, indices), (k.shape[0], size_limit), name="store_cache")
     module.store_cache(
         k,
         v,

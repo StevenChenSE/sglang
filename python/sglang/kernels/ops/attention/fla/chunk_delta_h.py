@@ -14,8 +14,10 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_offsets,
 )
 from sglang.kernels.ops.attention.fla.op import exp, exp2, safe_exp
+from sglang.kernels.ops.attention.fla.flight_recorder import record, record_with_ring
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
+    get_witness,
     is_nvidia_hopper,
 )
 
@@ -63,6 +65,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_init_state,
     cu_seqlens,
     chunk_offsets,
+    nt_host,
+    num_states,
+    witness,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -78,16 +83,32 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    rec_ring=None,
+    rec_slot=-1,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
+    if rec_ring:
+        if rec_slot >= 0:
+            if (i_v == 0) and (i_nh == 0):
+                tl.store(rec_ring + rec_slot * 32 + 24, 1)
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
         ).to(tl.int32)
+        if not ((bos >= 0) & (bos <= eos) & (eos <= T)):
+            tl.store(witness + 0, 1)
+            tl.store(witness + 1, 2000000 + bos)
+            tl.store(witness + 2, eos)
+            return
         T = eos - bos
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
+        if not ((boh >= 0) & (boh + NT <= nt_host)):
+            tl.store(witness + 0, 1)
+            tl.store(witness + 1, boh)
+            tl.store(witness + 2, NT)
+            return
     else:
         bos, eos = i_n * T, i_n * T + T
         NT = tl.cdiv(T, BT)
@@ -119,6 +140,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # per-slot pitch spans ALL layers' state, not H*V*K. int64: envelope pitches
     # overflow an int32 index product.
     index = tl.load(initial_state_indices + i_n).to(tl.int64)
+    if not ((index >= -1) & (index < num_states)):
+        tl.store(witness + 0, 1)
+        tl.store(witness + 1, 1000000 + index.to(tl.int32))
+        tl.store(witness + 2, num_states)
+        return
     # Padded rows carry the -1 sentinel; the decode kernel guards on it
     # (fused_recurrent.py), the chunked extend path did not.
     valid_state = index >= 0
@@ -312,6 +338,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             )
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
+    if rec_ring:
+        if rec_slot >= 0:
+            if (i_v == 0) and (i_nh == 0):
+                tl.store(rec_ring + rec_slot * 32 + 25, 1)
+
 
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
@@ -353,6 +384,9 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
+    ring, rslot = record_with_ring(24, (k, u, w, h, initial_state, initial_state_indices, cu_seqlens, chunk_offsets), (T, NT), name="fwd_h")
+    if ring is None:
+        ring, rslot = k, -1
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -368,6 +402,11 @@ def chunk_gated_delta_rule_fwd_h(
         stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        nt_host=NT,
+        num_states=(initial_state.shape[0] if initial_state is not None else 0),
+        witness=get_witness(k.device),
+        rec_ring=ring,
+        rec_slot=rslot,
         T=T,
         H=H,
         Hg=Hg,

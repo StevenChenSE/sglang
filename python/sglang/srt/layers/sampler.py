@@ -415,10 +415,21 @@ class Sampler(nn.Module):
         flat_ids = probs_idx[flat_rows, flat_cols].to(torch.int32)
         mask_lengths = effective_keep_mask.sum(dim=-1, dtype=torch.int32)
 
-        flat_ids_cpu = flat_ids.cpu().tolist()
-        mask_lengths_cpu = mask_lengths.cpu().tolist()
-        sampled_in_idx_cpu = sampled_in_idx.cpu().tolist()
-        sampled_tokens_cpu = batch_next_token_ids.to(torch.int32).cpu().tolist()
+        # JOURNAL 12.83: five separate .cpu() calls each drain the stream;
+        # pack the int payloads into one transfer (one drain) and keep the
+        # float logprobs on a second. Values and order are unchanged.
+        sampled_tokens_i32 = batch_next_token_ids.to(torch.int32)
+        packed_int = torch.cat(
+            [flat_ids, mask_lengths, sampled_in_idx.to(torch.int32), sampled_tokens_i32]
+        ).cpu()
+        packed_int_cpu = packed_int.tolist()
+        _n_flat = flat_ids.numel()
+        _n_bs = mask_lengths.numel()
+        _off = 0
+        flat_ids_cpu = packed_int_cpu[_off:_off + _n_flat]; _off += _n_flat
+        mask_lengths_cpu = packed_int_cpu[_off:_off + _n_bs]; _off += _n_bs
+        sampled_in_idx_cpu = packed_int_cpu[_off:_off + _n_bs]; _off += _n_bs
+        sampled_tokens_cpu = packed_int_cpu[_off:_off + _n_bs]
         selected_logprobs_cpu = selected_logprobs.cpu().tolist()
 
         masks = []

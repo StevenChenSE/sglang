@@ -4,9 +4,10 @@
 
 import ctypes
 import logging
+import os
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -33,6 +34,11 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_musa = is_musa()
+
+# RDNA3 standalone custom allreduce (see custom_all_reduce_ops.py). On this
+# stack peer kernel reads only observe HBM, so graph capture must use the
+# copy-in (unreg) path into the dedicated uncached shared buffer.
+_RDNA_CUSTOM_AR = os.environ.get("SGLANG_RDNA_CUSTOM_AR", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,10 @@ class CustomAllreduce:
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
+        self._ar_dbg = False  # set in HIP init branch when SGLANG_AR_DEBUG_VERIFY
+        self._ar_dbg_n = 0
+        self._ar_ck = False  # set in HIP init branch when SGLANG_AR_CHECKSUM
+        self._ck_n = 0
 
         if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
@@ -84,12 +94,19 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
-        full_nvlink = can_use_custom_all_reduce_with_nvlink(
-            group=group,
-            device=device,
-            supported_world_size=self._SUPPORTED_WORLD_SIZES,
-            cls_name="CustomAllreduce",
-        )
+        if _RDNA_CUSTOM_AR:
+            # Skip the NVLink/amdsmi probe entirely: on this box amdsmi is
+            # unavailable (NameError inside is_full_nvlink aborts setup), and
+            # the RDNA custom AR works over PCIe via IPC + dedicated uncached
+            # buffers. world_size==2 dispatches to the one-shot kernel.
+            full_nvlink = False
+        else:
+            full_nvlink = can_use_custom_all_reduce_with_nvlink(
+                group=group,
+                device=device,
+                supported_world_size=self._SUPPORTED_WORLD_SIZES,
+                cls_name="CustomAllreduce",
+            )
         if full_nvlink is None:
             return  # fail to get nvlink status
 
@@ -124,20 +141,76 @@ class CustomAllreduce:
         else:
             # meta data buffers need to be "uncached" for signal on MI200
             self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-            self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
+            if hasattr(ops, "allocate_reg_buffer"):
+                # Dedicated uncached allocation: PCIe peer kernel reads only
+                # observe HBM, so the shared copy-in buffer must avoid the
+                # writer's L2 (torch caching-allocator segments read back
+                # zeros on the peer).
+                self.buffer = ops.allocate_reg_buffer(max_size)
+            else:
+                self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
             handle = ops.get_meta_buffer_ipc_handle(self.meta)
             shard_data = (
                 bytes(handle),  # ipc handle to base ptr
                 0,  # offset of base ptr
             )
-            handles, offsets = self._gather_ipc_meta(shard_data)
+            # 12.116: SGL_RDNA_DUMMY_HANDLES skips the device-group object
+            # collective at init (broadcast_object_list over the NCCL group).
+            # Discriminates "init-time object collective poisons NCCL" from
+            # the rest of the real-init sequence.
+            if get_bool_env_var("SGL_RDNA_DUMMY_HANDLES"):
+                handles = [b"\0" * 64 for _ in range(self.world_size)]
+                offsets = [0 for _ in range(self.world_size)]
+                logger.warning("[rdna_ar] _gather_ipc_meta SKIPPED (dummy handles)")
+            else:
+                handles, offsets = self._gather_ipc_meta(shard_data)
             self.rank_data = torch.empty(
                 max_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
             )
-            self.register_buffer(self.buffer)
+            # 12.118: SGL_RDNA_DROP_BUFS=1 — release the python refs to the
+            # ca buffers after init (meta/reg/rank_data freed; C++ _ptr keeps
+            # dangling pointers — ONLY safe when ca kernels never execute,
+            # e.g. under SGL_RDNA_FORCE_NCCL). Tests whether LIVE peer-visible
+            # uncached allocations are the graph-boot poison.
+            if get_bool_env_var("SGL_RDNA_DROP_BUFS"):
+                logger.warning(
+                    "[rdna_ar] DROP_BUFS: releasing meta/buffer/rank_data "
+                    "refs — ca kernels must NEVER run this boot"
+                )
+                self.meta = None
+                self.buffer = None
+                self.rank_data = None
+            # 12.116: SGL_RDNA_SKIP_REG_REGISTER skips ONLY the IPC mapping
+            # of the peer's reg buffer (hipIpcOpenMemHandle); meta buffer,
+            # rank_data, and signal setup still run. Discriminates the reg
+            # IPC mapping from the rest of init.
+            if not get_bool_env_var("SGL_RDNA_SKIP_REG_REGISTER"):
+                self.register_buffer(self.buffer)
+            else:
+                logger.warning(
+                    "[rdna_ar] register_buffer SKIPPED (env gate)"
+                )
+
+        # 12.115 live-context AR verification: when enabled, the patched AR
+        # kernel (rdna_ar v14) recomputes out[0..3] from both ranks' buffers
+        # on EVERY launch (captured or eager) and counts mismatches in device
+        # memory; should_custom_ar logs+resets the counters every 500 calls.
+        self._ar_dbg = get_bool_env_var("SGLANG_AR_DEBUG_VERIFY")
+        self._ar_dbg_n = 0
+        if self._ar_dbg and hasattr(ops, "ar_dbg_set"):
+            ops.ar_dbg_set(1)
+            log_info_on_rank0(
+                logger, "[AR-VERIFY] in-kernel AR verification enabled"
+            )
+        # 12.116 full-payload cross-rank checksum (eager diag boot): every 16th
+        # non-capturing call, verify out_sum == in_sum(self)+in_sum(peer) via
+        # gloo exchange. Catches stale-tail/partial-copy bugs the 7-element
+        # kernel probe can miss. Costs ~2 syncs per checked call.
+        self._ar_ck = get_bool_env_var("SGLANG_AR_CHECKSUM")
+        self._ck_n = 0
 
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
@@ -185,6 +258,13 @@ class CustomAllreduce:
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
+        # 12.117: SGL_RDNA_NULL_CAPTURE makes the ca capture context a
+        # no-op (no _IS_CAPTURING, no capture-exit register_graph_buffers
+        # object collectives) — poison-B probe for inert/full ca boots.
+        if get_bool_env_var("SGL_RDNA_NULL_CAPTURE"):
+            logger.warning("[rdna_ar] capture() NULLIFIED (env gate)")
+            yield
+            return
         try:
             self._IS_CAPTURING = True
             yield
@@ -260,6 +340,28 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        # 12.116 discriminator: keep the RDNA custom-AR fully initialized
+        # (peer access, uncached buffers, IPC registrations) but never
+        # execute its kernels — every collective falls back to NCCL. If a
+        # boot with this flag is healthy, corruption requires kernel
+        # execution; if corrupt, it comes from init side effects.
+        if os.environ.get("SGL_RDNA_FORCE_NCCL", "0") == "1":
+            return False
+        # 12.115: counter readout is a synchronizing D2H — never during graph
+        # capture (it invalidates the capture). The device-side counter ticks
+        # at every kernel launch incl. replays, so deferred reads are exact.
+        if (
+            self._ar_dbg
+            and hasattr(ops, "ar_dbg_pop")
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._ar_dbg_n += 1
+            if self._ar_dbg_n % 500 == 0:
+                mm, calls = ops.ar_dbg_pop()
+                logger.warning(
+                    f"[AR-VERIFY] rank={self.rank} first_4elem mismatches={mm} "
+                    f"calls={calls}"
+                )
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -276,6 +378,10 @@ class CustomAllreduce:
         if _is_hip:
             if self.use_amd_deterministic_impl:
                 return True
+            if _RDNA_CUSTOM_AR:
+                # Standalone RDNA custom AR: PCIe peer access works via
+                # dedicated uncached buffers; no NVLink required for ws=2.
+                return inp_size <= self.max_size
             if self.full_nvlink:
                 return inp_size <= self.max_size
             return False
@@ -304,7 +410,35 @@ class CustomAllreduce:
                 ops.all_reduce_reg(self._ptr, inp, out)
             else:
                 ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
+            if self._ar_ck and not torch.cuda.is_current_stream_capturing():
+                self._checksum_verify(inp, out)
         return out
+
+    def _checksum_verify(self, inp: torch.Tensor, out: torch.Tensor):
+        """12.116: full-payload cross-rank consistency check (eager diag).
+
+        out must equal the sum of both ranks' pre-AR inputs. Sums are
+        computed on-GPU in fp32 and exchanged via gloo object gather.
+        bf16 rounding across the payload stays well inside the 2% window;
+        stale-tail or partial-copy bugs are O(1) off and trip it loudly.
+        """
+        self._ck_n += 1
+        if self._ck_n % 16:
+            return
+        in_s = float(inp.float().sum().item())
+        out_s = float(out.float().sum().item())
+        parts = [None] * self.world_size
+        dist.all_gather_object(parts, in_s, group=self.group)
+        expected = float(sum(float(p) for p in parts))
+        bad = abs(out_s - expected) > max(1.0, 0.02 * abs(expected))
+        # 12.116: heartbeat — proves the probe RAN and lets us distinguish
+        # "verified clean" from "never executed".
+        if bad or (self._ck_n // 16) % 64 == 0:
+            logger.warning(
+                f"[AR-CKSUM] rank={self.rank} call={self._ck_n} "
+                f"shape={tuple(inp.shape)} out_sum={out_s:.6e} "
+                f"expected={expected:.6e} {'MISMATCH' if bad else 'ok'}"
+            )
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
@@ -313,7 +447,12 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                # RDNA: capture the copy-in path so the graph reads the
+                # dedicated uncached buffer, not the peer's hidden states
+                # (whose L2-dirty writes are invisible over PCIe).
+                return self._all_reduce_impl(
+                    input, registered=not self.tms_cudagraph and not _RDNA_CUSTOM_AR
+                )
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
@@ -327,6 +466,51 @@ class CustomAllreduce:
                     return torch.zeros_like(input)
         else:
             return self._all_reduce_impl(input, registered=False)
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Fused all-reduce + residual-add + RMSNorm (standalone RDNA ext, ws=2).
+
+        Returns (normed, residual_out) or None to let the caller fall back to
+        the unfused AR + separate RMSNorm path.
+        """
+        if self.disabled or not _RDNA_CUSTOM_AR:
+            return None
+        if not hasattr(ops, "fused_allreduce_rmsnorm"):
+            return None
+        if (
+            self._IS_CAPTURING
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_tc_piecewise_cuda_graph()
+        ):
+            return None  # warmup: caller falls back to the unfused path
+        if input_.dim() != 2 or input_.shape[0] < 1:
+            return None
+        tokens, hidden = input_.shape
+        if hidden % 8 != 0 or hidden > 8192 or tokens > 32:
+            return None
+        if input_.dtype not in (torch.bfloat16, torch.float16):
+            return None
+        if not self.should_custom_ar(input_):
+            return None
+        out_normed = torch.empty_like(input_)
+        out_residual = torch.empty_like(input_)
+        ops.fused_allreduce_rmsnorm(
+            self._ptr,
+            input_,
+            residual_inp_,
+            weight_,
+            float(eps),
+            self.buffer,
+            out_normed,
+            out_residual,
+        )
+        return out_normed, out_residual
 
     def close(self):
         if not self.disabled and self._ptr:

@@ -9,6 +9,9 @@ import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+
+from sglang.kernels.ops.attention.fla.flight_recorder import record
+from sglang.srt.utils.flight_flags import bisect_sync
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
@@ -1665,7 +1668,9 @@ class RowParallelLinear(LinearBase):
                 if quantize_communications:
                     output = tensor_model_parallel_quant_all_reduce(output_parallel)
                 else:
+                    record(34, (output_parallel,), (output_parallel.numel(),), name="tp_all_reduce")
                     output = tensor_model_parallel_all_reduce(output_parallel)
+                    bisect_sync(f"tp_all_reduce numel={output_parallel.numel()}")
         else:
             output = output_parallel
 

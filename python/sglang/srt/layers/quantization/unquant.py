@@ -96,6 +96,27 @@ class Bf16GemmBackend(Enum):
 
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
+_bf16_gemm_log_count = 0
+_fp16_gemm_log_count = 0
+
+
+def _detect_rdna_skinny() -> bool:
+    """gfx110x only (RDNA3 consumer): env SGLANG_RDNA_SKINNY_GEMM=0 disables."""
+    import os
+
+    if os.environ.get("SGLANG_RDNA_SKINNY_GEMM", "1") == "0":
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        name = torch.cuda.get_device_properties(0).gcnArchName or ""
+        return any(a in name for a in ("gfx1100", "gfx1101", "gfx1102"))
+    except Exception:
+        return False
+
+
+_RDNA_SKINNY_GEMM = False  # set True lazily after CUDA init (see _maybe_arm)
+_RDNA_SKINNY_TRIED = False
 _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
 _hopper_bf16_gemv = None
@@ -385,7 +406,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
-        elif (
+        if (
             get_bf16_gemm_backend().is_optimized()
             and x.is_cuda
             and x.dtype == torch.bfloat16
@@ -402,6 +423,60 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        # RDNA3 skinny-M bf16 GEMM: cuBLAS/Tensile picks latency-bound configs
+        # for small M on gfx1100 (cold L2: 1.8ms per draft-step GEMM set vs
+        # 1.2ms for the memory-bound Triton kernel, and the row-contiguous
+        # variant is 2.5x faster again at M=4: 844us vs 2.1ms per set).
+        # Gate: bf16, M<=8, no bias, env kill-switch.
+        global _RDNA_SKINNY_GEMM, _RDNA_SKINNY_TRIED
+        if not _RDNA_SKINNY_TRIED:
+            _RDNA_SKINNY_TRIED = True
+            _RDNA_SKINNY_GEMM = _detect_rdna_skinny()
+        if (
+            _RDNA_SKINNY_GEMM
+            and x.is_cuda
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and layer.weight.dtype == x.dtype
+            and bias is None
+            and x.dim() >= 2
+            and 0 < x.numel() // x.shape[-1] <= 8
+        ):
+            from sglang.kernels.ops.gemm.rdna_skinnym_gemm import skinny_linear
+
+            return skinny_linear(x, layer.weight)
+
+        global _fp16_gemm_log_count
+        import os as _os
+        if (
+            _os.environ.get("SGLANG_LOG_FP16_GEMM")
+            and _fp16_gemm_log_count < 4000
+            and x.numel() // x.shape[-1] <= 8
+            and x.dtype == torch.float16
+            and layer.weight.dtype == torch.float16
+        ):
+            _fp16_gemm_log_count += 1
+            print(
+                f"[fp16gemm] m={x.numel() // x.shape[-1]} n={layer.weight.shape[0]} "
+                f"k={layer.weight.shape[1]} cnt={_fp16_gemm_log_count}",
+                flush=True,
+            )
+
+        import os as _os
+
+        global _bf16_gemm_log_count
+        if (
+            _os.environ.get("SGLANG_LOG_BF16_GEMM")
+            and _bf16_gemm_log_count < 4000
+            and x.numel() // x.shape[-1] <= 8
+            and layer.weight.shape[0] * layer.weight.shape[1] > 5_000_000
+        ):
+            _bf16_gemm_log_count += 1
+            _m = x.numel() // x.shape[-1]
+            print(
+                f"[bf16gemm] m={_m} n={layer.weight.shape[0]} "
+                f"k={layer.weight.shape[1]} cnt={_bf16_gemm_log_count}",
+                flush=True,
+            )
         return F.linear(x, layer.weight, bias)
 
     def apply_into(

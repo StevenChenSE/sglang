@@ -140,7 +140,20 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     prefix=add_prefix("lm_head", prefix),
                 )
 
-        self.logits_processor = LogitsProcessor(config)
+        # With topk==1 and no rejection sampling the draft only needs the
+        # global argmax, so keep logits local (skip the full-vocab all-gather,
+        # ~1 MB/step of PCIe traffic at TP=2) and let the worker exchange
+        # (max, index) pairs instead.
+        _top1_only = False
+        try:
+            _spec = get_spec()
+            _top1_only = (
+                _spec.speculative_eagle_topk == 1
+                and not _spec.speculative_use_rejection_sampling
+            )
+        except Exception:
+            _top1_only = False
+        self.logits_processor = LogitsProcessor(config, skip_all_gather=_top1_only)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -170,6 +183,31 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if self.config.tie_word_embeddings:
             return
 
+        import os
+        if os.environ.get("SGL_RDNA_FP8_DRAFT_HEAD", "0") == "1":
+            # 12.116: private fp8-e4m3 head copy for the DRAFT loop only.
+            # set_lm_head_from_target's default SHARES the target's head
+            # module — quantizing in place would poison verification. The
+            # draft only argmaxes (topk=1, no rejection sampling) and the
+            # target still gates acceptance, so a quantized proposal
+            # distribution costs a little accept rate, never correctness
+            # (offline argmax agreement 1.0000, JOURNAL 12.116).
+            try:
+                from sglang.kernels.ops.gemm.rdna_skinnym_gemm import (
+                    quantize_head_fp8,
+                )
+
+                w = target_lm_head.weight
+                if w.dtype != torch.bfloat16:
+                    w = w.to(torch.bfloat16)
+                q, scale = quantize_head_fp8(w.data)
+                holder = copy.copy(target_lm_head)
+                holder.weight = q
+                holder._fp8_scale = scale
+                self.lm_head = holder
+                return
+            except Exception as e:
+                print(f"[rdna] fp8 draft-head build failed ({e!r}); sharing bf16")
         self.lm_head = target_lm_head
 
     @torch.no_grad()

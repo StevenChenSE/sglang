@@ -137,6 +137,39 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_cache_indices = mamba_cache_indices.clone()
             mamba_cache_indices[_real_bs:] = -1
 
+        # 12.145: host-side pool guard — mamba slot ids feed GDN state kernels
+        # as raw offsets; a stale/corrupt id writes out of bounds. Raise before
+        # launch (never during graph capture: .item() syncs are illegal there).
+        import os as _os
+        from sglang.srt.utils.flight_flags import flag_on
+
+        if (flag_on("POOL_GUARD") or _os.environ.get("SGL_POOL_GUARD")) and not torch.cuda.is_current_stream_capturing():
+            # MambaPool tensors are (size + 1) rows: slot 0 = padding anchor,
+            # id `size` = trailing allocatable row (allocator free list is
+            # arange(1, size+1)). Valid slot ids are [0, size] INCLUSIVE.
+            _mpool_size = int(self.req_to_token_pool.mamba_pool.size) + 1
+            for _name, _t in (
+                ("mamba_cache_indices", mamba_cache_indices),
+                ("mamba_track_indices", forward_batch.mamba_track_indices),
+            ):
+                if _t is None or _t.numel() == 0:
+                    continue
+                _t_f = _t.flatten().to(torch.int64)
+                _mask = _t_f != -1  # -1 = graph-padding sentinel (skipped)
+                if bool(_mask.any()):
+                    _mn = int(_t_f[_mask].min().item())
+                    _mx = int(_t_f[_mask].max().item())
+                    if _mn < 0 or _mx >= _mpool_size:
+                        import traceback as _tb
+                        _head = (
+                            f"POOL GUARD VIOLATION {_name}: min={_mn} max={_mx} "
+                            f"allowed=[0, {_mpool_size})"
+                        )
+                        with open(_os.path.expanduser("~/pool_guard.log"), "a") as _f:
+                            _f.write(f"\n==== {_head}\n")
+                            _f.write("".join(_tb.format_stack()[-30:]) + "\n")
+                        raise RuntimeError(_head)
+
         replayssm_write_pos = None
         replayssm_force_flush = None
         if forward_batch.forward_mode.is_decode_or_idle():

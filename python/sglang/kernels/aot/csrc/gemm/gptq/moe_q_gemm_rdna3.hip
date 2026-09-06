@@ -608,7 +608,7 @@ void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
   int groups = (int)b_scales.size(1);
 
   TORCH_CHECK(size_k % 32 == 0, "K must be a multiple of 32");
-  TORCH_CHECK(groups == 1 || (size_k / groups) % 32 == 0,
+  TORCH_CHECK(groups >= 1 && (groups == 1 || (size_k / groups) % 32 == 0),
               "group_size must be a multiple of 32 on scalar path");
   TORCH_CHECK(size_n % 8 == 0, "N must be a multiple of 8 (64-bit atomic CAS)");
 

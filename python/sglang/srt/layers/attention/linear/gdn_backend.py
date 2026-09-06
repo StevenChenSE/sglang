@@ -775,6 +775,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
+                if conv_states.dtype != mixed_qkv_to_track.dtype:
+                    # fp16 activations vs bf16-persisted conv cache: the cache
+                    # is authoritative; cast the incoming window to match.
+                    mixed_qkv_to_track = mixed_qkv_to_track.to(conv_states.dtype)
                 conv_states[forward_metadata.conv_states_mask_indices] = (
                     mixed_qkv_to_track
                 )

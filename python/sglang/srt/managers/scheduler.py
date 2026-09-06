@@ -15,6 +15,7 @@
 
 import dataclasses
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -298,6 +299,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.phase_timer import get_phase_timer as _get_phase_timer_pt
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
@@ -395,6 +397,65 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _start_stack_sampler(tp_rank: int):
+    """Env-gated lightweight Python stack sampler (SGLANG_STACK_SAMPLE=1).
+
+    Samples sys._current_frames() every 20 ms in a daemon thread and writes
+    per-frame hit counts to /tmp/sgl_stack_sample_r{rank}.json every 10 s.
+    Negligible memory/CPU cost; used instead of torch profiler on hosts where
+    the profiler OOMs.
+    """
+    import sys as _sys
+    import threading as _threading
+    import time as _time
+
+    counts = {}
+    lock = _threading.Lock()
+    out_path = f"/tmp/sgl_stack_sample_r{tp_rank}.json"
+
+    def _walk(frame):
+        chain = []
+        while frame is not None:
+            code = frame.f_code
+            chain.append(f"{code.co_filename.split('/')[-1]}:{code.co_name}")
+            frame = frame.f_back
+            if len(chain) > 60:
+                break
+        return tuple(chain)
+
+    def _loop():
+        next_flush = _time.time() + 10
+        while True:
+            try:
+                frames = _sys._current_frames()
+                threads = {t.ident: t.name for t in _threading.enumerate()}
+                with lock:
+                    for tid, frame in frames.items():
+                        chain = _walk(frame)
+                        name = threads.get(tid, str(tid))
+                        key = (name, chain[:24])
+                        counts[key] = counts.get(key, 0) + 1
+            except Exception:
+                pass
+            if _time.time() >= next_flush:
+                try:
+                    with lock:
+                        snap = {
+                            "|".join(k[1][:10]): {"thread": k[0], "n": v, "stack": list(k[1])}
+                            for k, v in counts.items()
+                        }
+                    with open(out_path, "w") as f:
+                        json.dump(snap, f)
+                except Exception:
+                    pass
+                next_flush = _time.time() + 10
+            _time.sleep(0.02)
+
+    t = _threading.Thread(target=_loop, daemon=True, name="stack_sampler")
+    t.start()
+    logger.info("stack sampler started -> %s", out_path)
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -431,6 +492,8 @@ class Scheduler(
         self.forward_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog()
+        if os.environ.get("SGLANG_STACK_SAMPLE"):
+            _start_stack_sampler(tp_rank)
 
         # Parse args
         self.server_args = server_args
@@ -1839,11 +1902,18 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        _phase_timer_pt = _get_phase_timer_pt()
+
         while True:
             if self.gracefully_exit:
                 break
 
+            # JOURNAL 12.113: cpu mark recv->plan->launch (timestamp-only);
+            # the python segment delaying the NEXT forward enqueue
+            _t_next = _phase_timer_pt.mark_begin()
+
             # Receive requests
+            _t_plan = _phase_timer_pt.mark_begin()
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -1875,13 +1945,21 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                _t_run = _phase_timer_pt.mark_begin()
                 batch_result = self.run_batch(batch)
+                _phase_timer_pt.mark_end("run_enqueue", _t_run)
+                _phase_timer_pt.mark_end("plan_recv", _t_plan)
+                _phase_timer_pt.mark_end("next_launch", _t_next)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                # JOURNAL 12.113: tail = war_barrier + batch.copy + append
+                _phase_timer_pt.mark_end("post_launch_tail", _t_next)
             else:
                 batch_result = None
                 self._sched_idled = True
+                _phase_timer_pt.mark_end("plan_recv", _t_plan)
+                _phase_timer_pt.mark_end("next_launch", _t_next)
 
             # Process the last batch
             if self.last_batch:
@@ -1894,7 +1972,9 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
+                _t_samp = _phase_timer_pt.mark_begin()
                 self.launch_batch_sample_if_needed(batch_result, batch)
+                _phase_timer_pt.mark_end("sample_launch", _t_samp)
 
             # Update last_batch
             self.last_batch = batch
@@ -5438,6 +5518,23 @@ def run_scheduler_process(
             dp_rank,
         )
 
+        # 12.152: memory-allocation history for the deep-context fault —
+        # records every alloc/free with Python stacks; the crash hook below
+        # dumps it so a faulting VA can be traced to the code that freed its
+        # block while a kernel was still in flight.
+        from sglang.srt.utils.flight_flags import flag_on
+
+        if flag_on("MEM_HISTORY") or os.getenv("SGL_MEM_HISTORY", "0") == "1":
+            try:
+                # torch 2.13: enabled must be "state" | "all" | None ("alloc"
+                # was the pre-2.6 name and raises here — 12.161).
+                torch.cuda.memory._record_memory_history(
+                    enabled="all", max_entries=500000, stacks="python"
+                )
+                logger.info("Memory history recording ENABLED (SGL_MEM_HISTORY=1)")
+            except Exception as e:
+                logger.warning(f"memory history enable failed: {e}")
+
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
@@ -5447,6 +5544,20 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        # 12.152: dump the allocation history FIRST — the faulting VA's block
+        # alloc/free stacks identify who released the buffer while in flight.
+        from sglang.srt.utils.flight_flags import flag_on
+
+        if flag_on("MEM_HISTORY") or os.getenv("SGL_MEM_HISTORY", "0") == "1":
+            try:
+                out = os.path.expanduser(
+                    "~/mem_history_" + str(os.getpid()) + "_"
+                    + str(int(time.time())) + ".pickle"
+                )
+                torch.cuda.memory._dump_snapshot(out)
+                logger.error("Memory history dumped to " + out)
+            except Exception as e:
+                logger.error("memory history dump failed: " + repr(e))
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.

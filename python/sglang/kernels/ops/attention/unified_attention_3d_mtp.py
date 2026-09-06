@@ -560,7 +560,8 @@ def unified_attention_3d_mtp_reduce_segments_kernel(
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = tl.max(segm_max)
+    # Floor: all-masked padding lanes load -inf and exp2(-inf - -inf)=NaN would poison expsum/output.
+    overall_max = tl.maximum(tl.max(segm_max), -3.4e38)
 
     # load and rescale segment exp sums
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)

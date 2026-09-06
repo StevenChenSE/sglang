@@ -24,6 +24,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.utils import get_witness
+from sglang.kernels.ops.attention.fla.flight_recorder import record
+
 _BLOCK = 1024
 
 
@@ -34,6 +37,7 @@ class ConvSlotDescriptor(NamedTuple):
     slot_stride: torch.Tensor  # [T] int64 element stride between slots
     num_layers: int
     max_feat_blocks: int
+    pool_size: int
 
 
 @triton.jit
@@ -43,6 +47,8 @@ def _fused_slot_clear_kernel(
     layer_stride_arr,
     slot_stride_arr,
     index_arr,
+    witness,
+    pool_size,
     MAX_FEAT_BLOCKS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -52,6 +58,11 @@ def _fused_slot_clear_kernel(
     base_addr = tl.load(ptr_arr + tid)
     feat = tl.load(feat_arr + tid)
     slot = tl.load(index_arr + iid)
+    if not ((slot >= 0) & (slot < pool_size)):
+        tl.store(witness + 0, 8)
+        tl.store(witness + 1, 1000000 + slot.to(tl.int32))
+        tl.store(witness + 2, iid)
+        return
     base = base_addr.to(tl.pointer_type(tl.bfloat16))
     row = (
         base
@@ -72,6 +83,8 @@ def _fused_slot_copy_kernel(
     slot_stride_arr,
     src_arr,
     dst_arr,
+    witness,
+    pool_size,
     MAX_FEAT_BLOCKS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -83,8 +96,15 @@ def _fused_slot_copy_kernel(
     layer_off = lid * tl.load(layer_stride_arr + tid)
     slot_stride = tl.load(slot_stride_arr + tid)
     base = base_addr.to(tl.pointer_type(tl.bfloat16))
-    src_row = base + layer_off + tl.load(src_arr + iid) * slot_stride
-    dst_row = base + layer_off + tl.load(dst_arr + iid) * slot_stride
+    src = tl.load(src_arr + iid)
+    dst = tl.load(dst_arr + iid)
+    if not ((src >= 0) & (src < pool_size) & (dst >= 0) & (dst < pool_size)):
+        tl.store(witness + 0, 9)
+        tl.store(witness + 1, 1000000 + src.to(tl.int32))
+        tl.store(witness + 2, dst)
+        return
+    src_row = base + layer_off + src * slot_stride
+    dst_row = base + layer_off + dst * slot_stride
     for fb in tl.static_range(MAX_FEAT_BLOCKS):
         cols = fb * BLOCK + tl.arange(0, BLOCK)
         mask = cols < feat
@@ -104,6 +124,7 @@ def build_conv_slot_descriptor(tensors: List[torch.Tensor]) -> ConvSlotDescripto
     device = t0.device
     ptr, feat, layer_stride, slot_stride = [], [], [], []
     max_feat = 0
+    pool_size = t0.shape[1]
     for t in tensors:
         assert t.dtype == torch.bfloat16, "fused slot ops assume bf16 conv state"
         assert t.shape[0] == num_layers, "conv tensors must share num_layers"
@@ -122,6 +143,7 @@ def build_conv_slot_descriptor(tensors: List[torch.Tensor]) -> ConvSlotDescripto
         slot_stride=to_i64(slot_stride),
         num_layers=num_layers,
         max_feat_blocks=triton.cdiv(max_feat, _BLOCK),
+        pool_size=pool_size,
     )
 
 
@@ -132,12 +154,15 @@ def fused_clear_conv_slots(desc: ConvSlotDescriptor, indices: torch.Tensor):
     index_arr = indices.to(torch.int64)
     # Slot count on the unbounded grid axis (gridDim.y/z cap at 65535).
     grid = (index_arr.numel(), desc.ptr.numel(), desc.num_layers)
+    record(27, (index_arr, desc.ptr), (index_arr.numel(), desc.pool_size), name="cow_clear")
     _fused_slot_clear_kernel[grid](
         desc.ptr,
         desc.feat,
         desc.layer_stride,
         desc.slot_stride,
         index_arr,
+        get_witness(index_arr.device),
+        desc.pool_size,
         MAX_FEAT_BLOCKS=desc.max_feat_blocks,
         BLOCK=_BLOCK,
     )
@@ -159,6 +184,7 @@ def fused_copy_conv_slots(
     src_arr = src_indices.to(torch.int64)
     dst_arr = dst_indices.to(torch.int64)
     grid = (src_arr.numel(), desc.ptr.numel(), desc.num_layers)
+    record(28, (src_arr, dst_arr, desc.ptr), (src_arr.numel(), desc.pool_size), name="cow_copy")
     _fused_slot_copy_kernel[grid](
         desc.ptr,
         desc.feat,
@@ -166,6 +192,8 @@ def fused_copy_conv_slots(
         desc.slot_stride,
         src_arr,
         dst_arr,
+        get_witness(src_arr.device),
+        desc.pool_size,
         MAX_FEAT_BLOCKS=desc.max_feat_blocks,
         BLOCK=_BLOCK,
     )

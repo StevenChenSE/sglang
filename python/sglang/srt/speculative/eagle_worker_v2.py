@@ -1,3 +1,4 @@
+import os
 import contextlib
 import logging
 import time
@@ -7,7 +8,11 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.speculative.phase_timer import get_phase_timer
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -126,6 +131,37 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 
+def _vocab_parallel_top1(logits: torch.Tensor):
+    """Global top-1 over TP-sharded local logits without an all-gather.
+
+    Exchanges only (max_val, global_idx) pairs (8 B/token). Preserves the
+    first-index tie-break across ranks (ties resolve to the lower rank, and
+    within a rank to torch.argmax's local choice). Returns (topk_p, topk_index)
+    matching the eager topk==1 contract: topk_p is ones (unused without
+    rejection sampling).
+    """
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_world_size,
+        get_tp_group,
+    )
+
+    local_idx = logits.argmax(dim=-1, keepdim=True)
+    local_val = logits.gather(-1, local_idx)
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        return torch.ones_like(local_idx, dtype=torch.float32), local_idx
+    local_size = logits.shape[-1]
+    tp = get_tp_group()
+    packed = torch.cat(
+        [local_val, (local_idx + tp.rank * local_size).to(torch.float32)], dim=-1
+    )
+    gathered = tp.all_gather(packed, dim=0).view(tp_size, *local_idx.shape, 2)
+    v0, i0 = gathered[0, :, :, 0], gathered[0, :, :, 1]
+    v1, i1 = gathered[1, :, :, 0], gathered[1, :, :, 1]
+    idx = torch.where(v1 > v0, i1, i0).to(torch.long)
+    return torch.ones_like(idx, dtype=torch.float32), idx
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -211,6 +247,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        _draft_lp = getattr(self.draft_runner.model, "logits_processor", None)
+        self.draft_logits_local = (
+            _is_hip
+            and self.topk == 1
+            and not get_spec().speculative_use_rejection_sampling
+            and _draft_lp is not None
+            and not getattr(_draft_lp, "do_tensor_parallel_all_gather", True)
+        )
+        if self.draft_logits_local:
+            logger.info("draft logits are TP-local: using vocab-parallel top-1")
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -325,6 +371,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+        # JOURNAL 12.103/12.105: optional int8 draft-head copy
+        # (SGLANG_INT8_DRAFT_HEAD=1). Builds a PRIVATE int8 per-row-quantized
+        # copy of the head and attaches it as _i8_head=(w8, scale) on the DRAFT
+        # model's logits_processor INSTANCE — never on the shared lm_head
+        # module (12.104 lesson: that module object is shared with the target,
+        # which silently made the target's verify logits int8 too). The target
+        # path stays exact fp16; only the proposal distribution shifts (~1%).
+        import os as _os
+
+        if _os.environ.get("SGLANG_INT8_DRAFT_HEAD") == "1":
+            _dh = unwrap_lora_layer(
+                getattr(self.draft_runner.model, "lm_head", None)
+            )
+            _dproc = getattr(self.draft_runner.model, "logits_processor", None)
+            if _dh is not None and _dproc is not None and not hasattr(
+                _dproc, "_i8_head"
+            ):
+                _w = _dh.weight.data
+                _scale = _w.abs().max(dim=1).values / 127.0
+                _w8 = (_w / _scale[:, None]).round().clamp(-127, 127).to(
+                    torch.int8
+                )
+                _dproc._i8_head = (_w8, _scale.half())
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -677,6 +747,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
+                # Index domain for the OOB check below: every branch here
+                # produces topk_index within the (gathered or local-full)
+                # next_token_logits, except the vocab-parallel top-1 branch,
+                # which yields GLOBAL vocab indices and overrides this bound.
+                oob_vocab_bound = logits_output.next_token_logits.shape[-1]
                 if get_spec().speculative_use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
@@ -697,7 +772,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             logits_output.next_token_logits, dim=-1, keepdim=True
                         )
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-                        forward_batch.positions.add_(1)
+                elif self.topk == 1 and self.draft_logits_local:
+                    # Local (skip-all-gather) draft logits: exchange 8-byte
+                    # (max, idx) pairs instead of the full vocab.
+                    topk_p, topk_index = _vocab_parallel_top1(
+                        logits_output.next_token_logits
+                    )
+                    forward_batch.positions.add_(1)
+                    # _vocab_parallel_top1 returns GLOBAL vocab indices
+                    # (local argmax + rank * shard_size, computed without an
+                    # all-gather), so validate against the sum-of-shards
+                    # vocab, not the local shard size — a winning shard on a
+                    # later rank yields indices >= the local shape[-1].
+                    oob_vocab_bound = (
+                        get_tensor_model_parallel_world_size()
+                        * logits_output.next_token_logits.shape[-1]
+                    )
                 else:
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
@@ -709,8 +799,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    oob_vocab_bound,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={oob_vocab_bound}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -871,19 +961,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        if self.draft_logits_local:
+            # Local (skip-all-gather) draft logits: exchange 8-byte pairs.
+            topk_p, topk_index = _vocab_parallel_top1(logits_output.next_token_logits)
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
-            draft_probs=probs if use_rejection_sampling else None,
+            draft_probs=None
+            if self.draft_logits_local
+            else (probs if use_rejection_sampling else None),
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
@@ -1028,6 +1124,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        elif self.topk == 1 and self.draft_logits_local:
+            ret_topk_p, ret_topk_index = _vocab_parallel_top1(
+                draft_logits_output.next_token_logits
+            )
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(
@@ -1230,23 +1331,43 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
+            _pt = get_phase_timer()
+            # JOURNAL 12.89: env-toggled cProfile over the spec-decode step
+            # loop (SGLANG_CPROFILE_SPEC=1, dumps at step 120). Zero overhead
+            # when disabled.
+            if os.environ.get("SGLANG_CPROFILE_SPEC") == "1":
+                global _cp_state
+                try:
+                    _cp_state
+                except NameError:
+                    import types as _t
+                    _cp_state = _t.SimpleNamespace(n=0, prof=None)
+                _cp_state.n += 1
+                import cProfile as _cPr, os as _os2
+                if _cp_state.n == 60:
+                    _cp_state.prof = _cPr.Profile()
+                    _cp_state.prof.enable()
+                elif _cp_state.n == 120 and _cp_state.prof is not None:
+                    _cp_state.prof.disable()
+                    _cp_state.prof.dump_stats("/tmp/spec_prof.out")
+                    _cp_state.prof = None
             if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
+                with _pt.span("draft"), \
+                        self.draft_worker.draft_tp_context(
+                            self.draft_worker.draft_runner.tp_group
+                        ), \
+                        speculative_moe_backend_context(), \
+                        speculative_moe_a2a_backend_context(), \
+                        spec_stage_span("draft"):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
-            assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+                assert verify_input.is_verify_input()
+                batch.spec_info = verify_input
+                with _pt.span("verify"):
+                    batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1256,15 +1377,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft_extend"),
-                ):
+                with _pt.span("draft_extend"), \
+                        self.draft_worker.draft_tp_context(
+                            self.draft_worker.draft_runner.tp_group
+                        ), \
+                        speculative_moe_backend_context(), \
+                        speculative_moe_a2a_backend_context(), \
+                        spec_stage_span("draft_extend"):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            _pt.step_done()
 
             return batch_output
 

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -213,7 +214,12 @@ def build_tree_kernel_efficient(
     else:
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
-    # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
+    # JOURNAL 12.110: ATTEMPTED cache + index-instead-of-unpack of retrieve_buf;
+    # REVERTED — live run wedged the scheduler (GPU 100%, /health 503 loop).
+    # The -1 init is apparently load-bearing (some cells are not rewritten
+    # each step), so the buffer must be freshly initialized per step.
+    # LESSON: verify the kernel's exact write pattern before caching ANY
+    # tree buffer. Original code restored verbatim below.
     retrieve_buf = torch.full(
         (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
     )

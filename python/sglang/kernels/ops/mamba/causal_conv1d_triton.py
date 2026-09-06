@@ -12,6 +12,9 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
+from sglang.kernels.ops.attention.fla.utils import get_witness
+from sglang.kernels.ops.attention.fla.flight_recorder import record_with_ring
+
 PAD_SLOT_ID = -1
 
 
@@ -30,6 +33,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    witness,
+    rec_ring,
+    rec_slot,
     # Strides
     stride_x_seq: tl.constexpr,  # stride to get to next sequence,
     stride_x_dim: tl.constexpr,  # stride to get to next feature-value,
@@ -75,11 +81,26 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # BLOCK_N elements along the feature-dimension (channel)
     idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
 
+    if rec_slot >= 0:
+        # flight: entry marker FIRST — before every early-return path, so
+        # e=0 strictly means "the stream never reached this kernel"
+        if (idx_seq == 0) and (chunk_offset == 0) and (tl.program_id(2) == 0):
+            tl.store(rec_ring + rec_slot * 32 + 24, 1)
+
     if idx_seq == pad_slot_id:
         return
 
     sequence_start_index = tl.load(query_start_loc_ptr + idx_seq)
     sequence_end_index = tl.load(query_start_loc_ptr + idx_seq + 1)
+    if not (
+        (sequence_start_index >= 0)
+        & (sequence_start_index <= sequence_end_index)
+        & (sequence_end_index <= seqlen)
+    ):
+        tl.store(witness + 0, 7)
+        tl.store(witness + 1, 2000000 + sequence_start_index)
+        tl.store(witness + 2, sequence_end_index)
+        return
     # find the actual sequence length
     seqlen = sequence_end_index - sequence_start_index
 
@@ -106,6 +127,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         if conv_state_batch_coord == pad_slot_id:
             # not processing as this is not the actual sequence
             return
+    if not (
+        (conv_state_batch_coord >= 0) & (conv_state_batch_coord < num_cache_lines)
+    ):
+        tl.store(witness + 0, 7)
+        tl.store(witness + 1, 1000000 + conv_state_batch_coord.to(tl.int32))
+        tl.store(witness + 2, idx_seq)
+        return
     conv_states_base = (
         conv_states_ptr
         + (conv_state_batch_coord * stride_conv_state_seq)
@@ -128,28 +156,28 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             mask_w = idx_feats < dim
             if KERNEL_WIDTH == 2:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
             if KERNEL_WIDTH == 3:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col1 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
                 conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
             if KERNEL_WIDTH == 4:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col2 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
                 conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col1 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
                 conv_states_ptrs = prior_tokens - 2 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
             if KERNEL_WIDTH == 5:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col3 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
                 conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col2 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
                 conv_states_ptrs = prior_tokens - 2 * stride_conv_state_tok  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col1 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
                 conv_states_ptrs = prior_tokens - 3 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
         else:
             # prior-tokens are zeros
             if KERNEL_WIDTH >= 2:  # STRATEGY1
@@ -384,6 +412,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
+    if rec_slot >= 0:
+        if (idx_seq == 0) and (chunk_offset == 0) and (tl.program_id(2) == 0):
+            tl.store(rec_ring + rec_slot * 32 + 25, 1)
+
 
 def causal_conv1d_fn(
     x: torch.Tensor,
@@ -517,6 +549,9 @@ def causal_conv1d_fn(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    ring, rslot = record_with_ring(26, (x, conv_states, out, cache_indices, query_start_loc, has_initial_state), (dim, cu_seqlen), name="conv_fwd")
+    if ring is None:
+        ring, rslot = x, -1
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -531,6 +566,9 @@ def causal_conv1d_fn(
         dim,
         cu_seqlen,
         num_cache_lines,
+        get_witness(x.device),
+        ring,
+        rslot,
         # stride
         stride_x_seq,
         stride_x_dim,
@@ -697,16 +735,16 @@ def _causal_conv1d_update_kernel(
     prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_tok
     if KERNEL_WIDTH >= 2:
         conv_states_ptrs = prior_tokens  # [BLOCK_N]
-        col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
     if KERNEL_WIDTH >= 3:
         conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
-        col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        col1 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
     if KERNEL_WIDTH >= 4:
         conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
-        col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        col2 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
     if KERNEL_WIDTH == 5:
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
-        col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        col3 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_ptr.dtype.element_ty)
 
     # STEP 2: assume state_len > seqlen
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]

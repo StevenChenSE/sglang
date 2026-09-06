@@ -179,6 +179,34 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
+def apply_rdna_fused_ar_rmsnorm(input_tensor: torch.Tensor):
+    """Standalone-RDNA fused AR+RMSNorm availability ( communicator-native API).
+
+    True when the custom-allreduce communicator exposes fused_allreduce_rmsnorm
+    (rdna_ar v13); the hook itself re-validates shapes and falls back to None.
+    """
+    # 12.118 kill switch: SGL_RDNA_NO_FUSED=1 disables the fused hook entirely
+    # (plain AR + separate RMSNorm). Poison-B discriminator boot.
+    import os as _os
+
+    if _os.environ.get("SGL_RDNA_NO_FUSED", "0") == "1":
+        return False
+    try:
+        ca = get_tp_group().ca_comm
+    except Exception:
+        return False
+    return (
+        is_hip()
+        and ca is not None
+        and not getattr(ca, "disabled", True)
+        and hasattr(ca, "fused_allreduce_rmsnorm")
+        and input_tensor.dim() == 2
+        and input_tensor.shape[-1] % 8 == 0
+        and input_tensor.shape[-1] <= 8192
+        and input_tensor.shape[0] <= 32
+    )
+
+
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
@@ -583,6 +611,7 @@ class LayerCommunicator:
                 if (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                    or apply_rdna_fused_ar_rmsnorm(hidden_states)
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     quant_result = None
                     if (
@@ -1154,6 +1183,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if (
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                or apply_rdna_fused_ar_rmsnorm(hidden_states)
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual, use_attn_tp_group=True

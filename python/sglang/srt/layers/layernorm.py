@@ -18,6 +18,9 @@ from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
+
+from sglang.kernels.ops.attention.fla.flight_recorder import record
+from sglang.srt.utils.flight_flags import bisect_sync
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -226,6 +229,14 @@ def _forward_with_allreduce_fusion(
                 if fused_result is not None:
                     return fused_result
             else:
+                # Communicator-native fused AR+RMSNorm (standalone RDNA ext):
+                # try it first; returns None when unavailable, then fall
+                # through to flashinfer / the unfused path.
+                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, residual, weight, norm_module.variance_epsilon
+                )
+                if fused_result is not None:
+                    return fused_result
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -237,10 +248,28 @@ def _forward_with_allreduce_fusion(
                 if fused_result[0] is not None:
                     return fused_result
 
-            # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
-                x = tensor_model_parallel_all_reduce(x)
-                return norm_module.forward(x, residual, None)
+            # Preserve correctness when every fused path is unavailable.
+            # 12.118 FIX: the non-aiter route (standalone RDNA custom AR) had
+            # NO unfused fallback — when the communicator-native fused op and
+            # flashinfer both decline, control fell through to
+            # norm_module.forward WITHOUT the all-reduce, i.e. RMSNorm over
+            # UN-REDUCED per-rank hidden states. This poisoned every
+            # custom-AR-enabled boot whose fused op declined (FORCE_NCCL
+            # probes, buffer-drop probes, capture-declines). Do the AR
+            # explicitly, then fused-add RMSNorm.
+            # 12.118 FIX (residual hole): the same hole existed on the aiter
+            # route — with _use_aiter set but aiter AR-fusion disabled
+            # (enable_aiter_allreduce_fusion off) or the fused op declined,
+            # neither guarded branch fired and the tail returned RMSNorm over
+            # un-reduced states. Caller contract (verified): every call site
+            # (LayerCommunicator in communicator.py, nemotron_h_utils.
+            # input_norm_maybe_fuse_allreduce) delegates the AR entirely to
+            # this helper and only all-reduces itself when NOT calling it —
+            # so this fallback is unconditional whenever world_size > 1. The
+            # tail return below is only for the residual-None /
+            # world_size == 1 paths, which need no reduction.
+            x = tensor_model_parallel_all_reduce(x)
+            return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
 
@@ -698,6 +727,7 @@ class RMSNorm(BaseFusedOp):
             output = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            record(35, (x, residual, output, residual_out), (x.numel(),), name="fused_add_rms_norm")
             fused_add_rms_norm(
                 output,
                 x,
@@ -706,12 +736,15 @@ class RMSNorm(BaseFusedOp):
                 self.weight.data,
                 self.variance_epsilon,
             )
+            bisect_sync("fused_add_rms_norm")
             if needs_reshape:
                 return output.reshape(original_shape), residual_out.reshape(
                     residual_shape
                 )
             return output, residual_out
+        record(36, (x, output), (x.numel(),), name="rms_norm")
         output = rms_norm(x, self.weight.data, self.variance_epsilon)
+        bisect_sync("rms_norm")
         if needs_reshape:
             output = output.reshape(original_shape)
         return output
@@ -1134,7 +1167,16 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if _use_aiter and _has_rocm_triton_gemma_rms_norm:
+        # 12.129: the triton gemma kernels are exact (maxdiff 0.0 vs fp32
+        # native) and 2-3x faster than the aten fallback chain. On non-aiter
+        # builds with no vllm rms_norm, every GemmaRMSNorm ran forward_native
+        # (~144 aten calls/step, 4-7ms/step of soup on qwen3.5). Opt the
+        # non-aiter path in via SGL_RDNA_GEMMA_TRITON=1 (rule B gate).
+        import os as _os
+
+        if _has_rocm_triton_gemma_rms_norm and (
+            _use_aiter or _os.environ.get("SGL_RDNA_GEMMA_TRITON", "0") == "1"
+        ):
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition

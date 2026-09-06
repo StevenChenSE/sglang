@@ -60,6 +60,27 @@ _BLOCK_CONFIG = {
     256: (32, 4),
 }
 
+# gfx1100 (RDNA3) tuning: measured sweep (scripts/sweep_verify_splitkv.py,
+# bs=1 MTP-3 shapes, fp8 KV). (32, 8) with num_stages=2 beats the CDNA default
+# everywhere deep — ctx 10k: 1119→1012 us; ctx 16k: 4566→1567 us (2.9x).
+# num_stages=2 software-pipelines the K/V loads (the launch below hardcodes
+# num_stages=1, which is latency-bound on RDNA3). CDNA (gfx95) keeps the
+# original MI350X-tuned config.
+_RDNA = False
+if torch.version.hip:
+    try:
+        _RDNA = any(
+            g in torch.cuda.get_device_properties(0).gcnArchName
+            for g in ("gfx110", "gfx115")
+        )
+    except Exception:
+        _RDNA = False
+_NUM_STAGES = 2 if _RDNA else 1
+if _RDNA:
+    _BLOCK_CONFIG[256] = (32, 8)
+
+
+
 
 def block_config(head_dim):
     """Return (BLOCK_N, num_warps) for a head_dim; default for untuned dims."""
@@ -522,7 +543,7 @@ class VerifySplitKV:
             BLOCK_N=self.block_n,
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
             num_warps=self.num_warps,
-            num_stages=1,
+            num_stages=_NUM_STAGES,
             **_AMD_LAUNCH_KWARGS,
         )
 
@@ -855,3 +876,31 @@ def verify_splitkv_fwd(
     )
 
     return True
+
+# RDNA3: route stage1 to the split-D v2 kernel (JOURNAL 12.54, live-wired
+# 12.78): same grid/traffic as stock, halves the K-tile registers. The
+# live launch passes num_warps=8 (block_config) but v2's optimum is W4 —
+# the wrapper overrides it. Placed AFTER the stock def so the assignment
+# survives (12.70 wiring bug).
+if torch.version.hip:
+    try:
+        _g = torch.cuda.get_device_properties(0).gcnArchName
+        if any(g in _g for g in ("gfx110", "gfx115")):
+            from sglang.kernels.ops.attention.verify_splitkv_v2 import (
+                _verify_prefix_stage1_v2 as _V2_KERNEL,
+            )
+
+            class _V2Launch:
+                def __init__(self, kern):
+                    self._k = kern
+
+                def __getitem__(self, grid):
+                    def launch(*args, **kwargs):
+                        kwargs["num_warps"] = 4
+                        return self._k[grid](*args, **kwargs)
+
+                    return launch
+
+            _verify_prefix_stage1 = _V2Launch(_V2_KERNEL)
+    except Exception:
+        pass

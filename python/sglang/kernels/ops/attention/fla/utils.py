@@ -100,6 +100,55 @@ def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
 
+# 12.149 (r13 follow-up): the identity key is only sound if the argument
+# tensors are never mutated in place between calls. SGL_FLA_CACHE_VERIFY
+# closes that assumption with data: on an identity hit, re-fingerprint the
+# tensor arguments and compare with the fingerprints captured at cache time.
+#   unset / 0     : off (zero overhead, original behaviour)
+#   1             : verify; on mismatch log the caller to ~/fla_cache_verify.log
+#                   and RECOMPUTE (correctness restored, evidence kept)
+#   raise         : verify; on mismatch raise (named, with stack)
+# Fingerprinting syncs tiny metadata tensors (cu_seqlens) — the cached helpers
+# already device→host them internally, so no new sync class is introduced.
+def _fla_cache_verify_mode() -> str:
+    from sglang.srt.utils.flight_flags import get_flag
+
+    return get_flag("FLA_CACHE_VERIFY", os.getenv("SGL_FLA_CACHE_VERIFY", "0"))
+
+_FLA_CACHE_VERIFY = None  # resolved lazily (file flags + env fallback)
+
+
+def _fla_fingerprint(t: torch.Tensor):
+    flat = t.detach().reshape(-1)
+    return (tuple(flat.shape), str(flat.dtype), flat.tolist())
+
+
+def _fla_verify_mismatch(fn, args, kwargs, entry_fps) -> bool:
+    import traceback
+
+    mismatched = []
+    for idx, (a, fp) in enumerate(zip(args, entry_fps)):
+        if fp is None or not isinstance(a, torch.Tensor):
+            continue
+        if _fla_fingerprint(a) != fp:
+            mismatched.append(idx)
+    if not mismatched:
+        return False
+    head = (
+        f"FLA CACHE STALENESS: {fn.__name__} identity hit with mutated tensor "
+        f"arg(s) {mismatched} (cached result was stale; recomputing)"
+    )
+    try:
+        with open(os.path.expanduser("~/fla_cache_verify.log"), "a") as f:
+            f.write(f"\n==== {head}\n")
+            f.write("".join(traceback.format_stack()[-25:]) + "\n")
+    except Exception:
+        pass
+    if _fla_cache_verify_mode() == "raise":
+        raise RuntimeError(head)
+    return True
+
+
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
     A decorator that caches the most recent results of a function with tensor inputs.
@@ -120,23 +169,33 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal cache_entries, cache_size
         for i, entry in enumerate(cache_entries):
-            last_args, last_kwargs, last_result = entry
+            last_args, last_kwargs, last_result = entry[0], entry[1], entry[2]
             if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
                 if all(a is b for a, b in zip(args, last_args)) and all(
                     k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
                 ):
+                    if _fla_cache_verify_mode() != "0":
+                        entry_fps = entry[3]
+                        if _fla_verify_mismatch(fn, args, kwargs, entry_fps):
+                            break  # stale: fall through to recompute
                     cache_entries = (
                         cache_entries[:i]
                         + cache_entries[i + 1 :]
-                        + [(args, kwargs, last_result)]
+                        + [(args, kwargs, last_result, entry[3] if len(entry) > 3 else None)]
                     )
                     return last_result
 
         result = fn(*args, **kwargs)
 
+        entry_fps = None
+        if _fla_cache_verify_mode() != "0":
+            entry_fps = [
+                _fla_fingerprint(a) if isinstance(a, torch.Tensor) else None
+                for a in args
+            ]
         if len(cache_entries) >= cache_size:
             cache_entries = cache_entries[1:]
-        cache_entries.append((args, kwargs, result))
+        cache_entries.append((args, kwargs, result, entry_fps))
         return result
 
     return wrapper
@@ -337,3 +396,36 @@ else:
 
 
 device_platform = get_available_device()
+
+
+# 12.145 kernel-witness: instrumented GDN/conv kernels write (kernel_id,
+# detail1, detail2) here and skip the offending store when their index
+# arithmetic detects an out-of-bounds condition, so the violation surfaces
+# as a named host error at the next sync instead of a wild GPU write.
+_WITNESS_TENSOR = None
+WITNESS_KERNEL_NAMES = {
+    1: "chunk_gated_delta_rule_fwd_h",
+    2: "chunk_gated_delta_rule_fwd_kkt_solve",
+    3: "recompute_w_u_fwd",
+    4: "chunk_fwd_o",
+    5: "chunk_local_cumsum_scalar",
+    6: "chunk_local_cumsum_vector",
+    7: "causal_conv1d_fwd",
+    8: "fused_slot_clear (COW clear)",
+    9: "fused_slot_copy (COW copy)",
+    10: "triton_mrope_fused (position gather)",
+    11: "extend_attention_fwd (_fwd_kernel)",
+}
+
+
+def get_witness(device):
+    global _WITNESS_TENSOR
+    if _WITNESS_TENSOR is None:
+        _WITNESS_TENSOR = torch.zeros(16, dtype=torch.int32, device=device)
+        try:
+            from sglang.srt.utils.async_probe import register_witness
+
+            register_witness(_WITNESS_TENSOR, WITNESS_KERNEL_NAMES)
+        except Exception:
+            pass
+    return _WITNESS_TENSOR

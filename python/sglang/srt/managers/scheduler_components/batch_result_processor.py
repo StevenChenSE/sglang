@@ -13,6 +13,7 @@ from typing import (
 
 import torch
 
+from sglang.srt.speculative.phase_timer import get_phase_timer
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -873,6 +874,11 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        # JOURNAL 12.113: begin post-sync accept-processing cpu mark
+        # (timestamp-only; quantifies the python segment between the overlap
+        # sync and the end of result processing — a component of the idle)
+        _pt = get_phase_timer()
+        _t_accept = _pt.mark_begin()
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
@@ -1006,6 +1012,8 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
         )
+        # JOURNAL 12.113: post-sync accept-processing cpu mark (timestamp-only)
+        _pt.mark_end("accept_process", _t_accept)
 
     def _normalize_decode_outputs(
         self,

@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -44,7 +45,7 @@
 
 #include "qdq_4_rdna3.cuh"
 
-#if defined(__HIPCC__) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))
+#if defined(__HIPCC__) && defined(__gfx1100__)
   #define __HIP__RDNA3__
 #endif
 
@@ -335,9 +336,11 @@ __global__ void gemm_q4_kernel_rdna3(
   const uint32_t* b_ptr = b_q_weight + qk * size_n + n;
 
   // Per-column dequant constants. We hold one set of (z, y) pairs per column.
-  // fp16 uses exact integer subtraction and scaling (z_h, y_h).
-  // bf16 uses fp32 scalars (z, y) because the dequant produces fp32 directly.
-  half2 z_h[4], y_h[4];
+  // fp16 uses the exllama (z1z16, y1y16) double-pair to enable the upper-
+  // nibble-*16 trick. bf16 uses fp32 scalars (z, y) because the dequant
+  // produces fp32 directly — see prep_zero_scale_bf16_f32 / the FMA
+  // bypass for the missing v_pk_fma_bf16 on gfx11.
+  half2 z1z16_h[4][2], y1y16_h[4][2];
   float z_b_f[4], y_b_f[4];
 
   auto refresh_group = [&](int g) {
@@ -351,7 +354,7 @@ __global__ void gemm_q4_kernel_rdna3(
   #pragma unroll
       for (int i = 0; i < 4; ++i) {
         prep_zero_scale_fp16((uint32_t)(zeros[i] + zero_offset), scales[i],
-                             z_h[i], y_h[i]);
+                             z1z16_h[i], y1y16_h[i]);
       }
     } else {
   #pragma unroll
@@ -371,13 +374,21 @@ __global__ void gemm_q4_kernel_rdna3(
     for (int j = 0; j < 4; ++j) block_c[m][j] = 0.0f;
   }
 
-  // Note on group-transition granularity: each outer iteration advances K by 32.
-  // We require group_size to be a multiple of 32 (standard GPTQ/AutoRound group_sizes
-  // are 32, 64, 128, etc.), which is strictly enforced via TORCH_CHECK at entry.
-  // We check `k >= nextgroup` defensively to ensure all group transitions are caught.
+  // Note on group-transition granularity: we check `k == nextgroup` at the
+  // start of each outer iteration (which advances K by 32). This is correct
+  // when group_size >= 32 OR group_size divides 32 evenly (groupsize is one
+  // of {1,2,4,8,16,32,64,128,...}). For group_size in {16, 8, 4, ...} the
+  // inner loop would cross a group boundary between j-iterations; we require
+  // group_size >= 32 here, mirroring exllama's assumption.
+  //
+  // Software pipelining: we issue all 4 vectorized weight loads up front
+  // before any dequant/FMA depends on them. This gives the AMDGPU backend
+  // freedom to schedule the global_loads early and overlap their latency
+  // with dequant + v_pk_fma_f16 of earlier iterations. Cost: 4×int4 = 16
+  // VGPRs in flight per thread, plenty of headroom on RDNA3.
   int k = offset_k;
   while (k < end_k) {
-    while (k >= nextgroup) {
+    if (k == nextgroup) {
       group++;
       nextgroup += groupsize;
       refresh_group(group);
@@ -399,10 +410,10 @@ __global__ void gemm_q4_kernel_rdna3(
 
       if constexpr (std::is_same<T, half>::value) {
         half2 dq[4][4];
-        dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0], z_h[0], y_h[0]);
-        dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1], z_h[1], y_h[1]);
-        dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2], z_h[2], y_h[2]);
-        dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3], z_h[3], y_h[3]);
+        dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0], z1z16_h[0], y1y16_h[0]);
+        dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1], z1z16_h[1], y1y16_h[1]);
+        dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2], z1z16_h[2], y1y16_h[2]);
+        dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3], z1z16_h[3], y1y16_h[3]);
 
   #pragma unroll
         for (int m = 0; m < M_COUNT; ++m) {
@@ -705,17 +716,14 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format) {
-#ifndef SGL_IS_RDNA
-  TORCH_CHECK(false, "gptq_gemm_rdna3 is only supported on RDNA architectures");
-#endif
+  // Validate inputs and pin the device context BEFORE the WMMA dispatch
+  // below: on a multi-GPU system the caller's current device may differ
+  // from a's, and every downstream access (stream query, data_ptr,
+  // allocation, kernel launch) must happen under a's device.
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA/HIP tensor");
   TORCH_CHECK(b_q_weight.is_cuda(), "b_q_weight must be a CUDA/HIP tensor");
   TORCH_CHECK(b_qzeros.is_cuda(), "b_qzeros must be a CUDA/HIP tensor");
   TORCH_CHECK(b_scales.is_cuda(), "b_scales must be a CUDA/HIP tensor");
-  TORCH_CHECK(a.is_contiguous(), "a must be contiguous");
-  TORCH_CHECK(b_q_weight.is_contiguous(), "b_q_weight must be contiguous");
-  TORCH_CHECK(b_qzeros.is_contiguous(), "b_qzeros must be contiguous");
-  TORCH_CHECK(b_scales.is_contiguous(), "b_scales must be contiguous");
   TORCH_CHECK(a.dim() == 2, "a must be 2D [M, K]");
   TORCH_CHECK(b_q_weight.dim() == 2, "b_q_weight must be 2D [K/8, N]");
   TORCH_CHECK(
@@ -724,12 +732,22 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
   TORCH_CHECK(a.scalar_type() == b_scales.scalar_type(),
               "b_scales dtype must match a");
 
-  if (a.size(0) >= 16 && a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+
+  // Metadata-only dispatch test; the WMMA TU re-validates under its own
+  // guard, which is now guaranteed to be a's device.
+  // SGL_FORCE_SCALAR_GPTQ=1 routes every shape to the scalar kernel below —
+  // counterfactual switch for the WMMA-wedge bisect (12.165).
+  static const bool force_scalar_gptq =
+      std::getenv("SGL_FORCE_SCALAR_GPTQ") != nullptr;
+  if (!force_scalar_gptq && a.dim() == 2 && b_q_weight.dim() == 2 &&
+      a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0 &&
+      ((a.scalar_type() == torch::kBFloat16 && a.size(0) >= 16) ||
+       (a.scalar_type() == torch::kHalf && a.size(0) >= 64))) {
     return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
                                 use_v2_format);
   }
 
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto stream = at::cuda::getCurrentCUDAStream();
 
   int size_m = (int)a.size(0);
@@ -737,9 +755,6 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
   int size_n = (int)b_q_weight.size(1);
   int groups = (int)b_qzeros.size(0);
 
-  TORCH_CHECK(size_k % 32 == 0, "K must be a multiple of 32");
-  TORCH_CHECK(groups >= 1 && (groups == 1 || (size_k / groups) % 32 == 0),
-              "group_size must be a multiple of 32 on scalar path");
   TORCH_CHECK(b_q_weight.size(0) * 8 == size_k,
               "b_q_weight first dim must be K/8");
   TORCH_CHECK(b_scales.size(0) == groups,
@@ -752,7 +767,6 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
 
   const int* g_idx_ptr = nullptr;
   if (!b_g_idx.device().is_meta() && b_g_idx.numel() > 0) {
-    TORCH_CHECK(b_g_idx.is_contiguous(), "b_g_idx must be contiguous");
     TORCH_CHECK(b_g_idx.scalar_type() == torch::kInt32,
                 "b_g_idx must be int32");
     g_idx_ptr = (const int*)b_g_idx.data_ptr();

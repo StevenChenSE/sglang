@@ -67,7 +67,7 @@ class _MlaBucket(NamedTuple):
 # paying at small batch, and dividing by batch * head_tiles keeps a smaller tp sane,
 # though tuned at tp 8.
 _MLA_BUCKETS = (
-    _MlaBucket(num_warps=4, num_stages=2, max_splits=112, batch_max=5),
+    _MlaBucket(num_warps=8, num_stages=2, max_splits=112, batch_max=5),  # 12.62: W8 -9.2% on RDNA3 bs<=5
     _MlaBucket(num_warps=2, num_stages=2, max_splits=256, batch_max=24),
     _MlaBucket(num_warps=1, num_stages=1, max_splits=256),
 )
@@ -1351,7 +1351,12 @@ def _lean_decode_block_n(Lk: int) -> int:
     """
     if not _is_hip:
         return 64
-    return 16 if Lk > 256 else 128
+    if Lk > 256:
+        return 16
+    if Lk >= 256:
+        import os as _os
+        return int(_os.environ.get("LEAN_BN", 32))  # gfx1100: 128 blows the compiler (JOURNAL 12.61)
+    return 128
 
 
 @triton.jit

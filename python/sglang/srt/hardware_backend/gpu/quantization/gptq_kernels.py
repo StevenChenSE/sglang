@@ -45,6 +45,8 @@ gptq_marlin_repack = _unsupported_kernel
 gptq_shuffle = _unsupported_kernel
 
 try:
+    from sglang.kernels.ops.attention.fla.flight_recorder import record
+    from sglang.srt.utils.flight_flags import bisect_sync
     from sgl_kernel import gptq_gemm, gptq_shuffle
 
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
@@ -61,6 +63,32 @@ class MarlinLinearLayerConfig:
     group_size: int
     zero_points: bool
     has_g_idx: bool
+
+
+# 12.165: pinned WMMA flight planes (7 tags x 2 planes x 32768 slots, 2 MiB).
+# Lazy-init on first apply so the install happens under the rank's device.
+_WMMA_PLANES = None
+
+
+def _ensure_wmma_flight():
+    global _WMMA_PLANES
+    if _WMMA_PLANES is not None:
+        return
+    try:
+        from sglang.srt.utils.flight_flags import flag_on
+
+        if not flag_on("FLIGHT_WMMA"):
+            _WMMA_PLANES = torch.empty(0)
+            return
+        import sgl_kernel.gemm as _sg
+        from sglang.kernels.ops.attention.fla import flight_recorder
+
+        t = torch.zeros(1 << 19, dtype=torch.int32, pin_memory=True)
+        _sg.wmma_flight_set(t)
+        flight_recorder.set_wmma_planes(t)
+        _WMMA_PLANES = t
+    except Exception:
+        _WMMA_PLANES = torch.empty(0)  # never retry in-process
 
 
 def gptq_marlin_moe_repack(
@@ -114,6 +142,8 @@ class GPTQLinearKernel:
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
 
+        record(33, (reshaped_x, layer.qweight), (reshaped_x.shape[0], layer.qweight.shape[-1]), name="gptq_gemm")
+        _ensure_wmma_flight()
         output = gptq_gemm(
             reshaped_x,
             layer.qweight,
@@ -123,6 +153,7 @@ class GPTQLinearKernel:
             self.use_shuffle,
             self.quant_config.weight_bits,
         )
+        bisect_sync(f"gptq_gemm M={reshaped_x.shape[0]} N={layer.qweight.shape[-1]}")
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)

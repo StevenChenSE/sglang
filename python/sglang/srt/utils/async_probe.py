@@ -6,11 +6,15 @@ sync point instead of as a silent NaN cascade or illegal-address crash.
 """
 
 import logging
+import os
 from typing import Optional
 
 import torch
 
 from sglang.srt.environ import envs
+
+# 12.145 host-side pool guard switch (see maybe_detect_oob)
+_POOL_GUARD = bool(os.environ.get("SGL_POOL_GUARD"))
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +103,43 @@ def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
 
 
+# 12.145 kernel-witness registry. Instrumented Triton kernels write
+# (kernel_id, detail1, detail2) into a shared int32 tensor instead of
+# trapping, so a detected violation surfaces as a named host-side error
+# instead of a GPU wedge. Registered lazily by the kernel wrappers.
+_WITNESS: dict = {}
+
+
+def register_witness(tensor: torch.Tensor, kernel_names: dict):
+    _WITNESS[tensor.device.index or 0] = (tensor, kernel_names)
+
+
+def _check_kernel_witness():
+    if not _WITNESS:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    for _dev, (tensor, names) in _WITNESS.items():
+        code = int(tensor[0].item())
+        if code == 0:
+            continue
+        d1 = int(tensor[1].item())
+        d2 = int(tensor[2].item())
+        name = names.get(code, f"kernel#{code}")
+        head = (
+            f"KERNEL WITNESS VIOLATION in {name} "
+            f"(detail1={d1}, detail2={d2}, raw={tensor.tolist()})"
+        )
+        try:
+            import traceback as _tb
+            with open(os.path.expanduser("~/witness.log"), "a") as f:
+                f.write(f"\n==== {head}\n")
+                f.write("".join(_tb.format_stack()[-30:]) + "\n")
+        except Exception:
+            pass
+        raise RuntimeError(head)
+
+
 def maybe_detect_inf(tensor: Optional[torch.Tensor], msg: str = ""):
     """Async Inf check — fp16 overflow surfaces as Inf before NaN."""
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
@@ -127,6 +168,28 @@ def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: 
     Low/high asserted separately so the message names which failed (low =
     negative/sentinel, high = out of range).
     """
+    # 12.145 witness check: instrumented kernels that detect an out-of-bounds
+    # index/pointer condition on-device write (kernel_id, detail1, detail2)
+    # into a small witness tensor and SKIP the offending store, so the GPU
+    # never faults. Read it here — this call already syncs via the guard.
+    _check_kernel_witness()
+    # 12.145: host-side synchronous guard (SGL_POOL_GUARD=1). Fires BEFORE the
+    # consuming kernel launches, dumping the bad index + traceback to
+    # ~/pool_guard.log. Unlike torch._assert_async this cannot destabilize
+    # ROCm graph capture and cannot fault the GPU.
+    if _POOL_GUARD and indices is not None and indices.numel() > 0:
+        import traceback as _tb
+        # .item() syncs — illegal during graph capture (dummy data there anyway).
+        if torch.cuda.is_current_stream_capturing():
+            return
+        mn = int(indices.min().item())
+        mx = int(indices.max().item())
+        if mn < low or mx >= high:
+            head = f"POOL GUARD VIOLATION {msg}: min={mn} max={mx} allowed=[{low}, {high})"
+            with open(os.path.expanduser("~/pool_guard.log"), "a") as f:
+                f.write(f"\n==== {head}\n")
+                f.write("".join(_tb.format_stack()[-30:]) + "\n")
+            raise RuntimeError(head)
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
         return
     if indices is None or indices.numel() == 0:

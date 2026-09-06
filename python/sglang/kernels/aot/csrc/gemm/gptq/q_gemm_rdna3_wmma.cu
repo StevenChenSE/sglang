@@ -51,6 +51,15 @@
 namespace vllm {
 namespace gptq_rdna3_wmma {
 
+// --- 12.165 flight instrumentation ---------------------------------------
+// Pinned-host plane array installed once per process via wmma_flight_set().
+// Layout: for kernel tag T, plane (T*2+0) holds entry marks, (T*2+1) exit
+// marks; slot = linear block index. Slots stay set (no clearing) — a wedge
+// snapshot is simply the last state: entered-without-exited = stuck blocks.
+#define WMMA_FLIGHT_SLOTN 32768
+__device__ int32_t* g_wmma_flight_dev = nullptr;
+#define WMMA_FLBLK (blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z))
+
 // Pull dequant types from the sibling namespace.
 using vllm::gptq_rdna3::bf162_t;
 using vllm::gptq_rdna3::bf16_t;
@@ -375,11 +384,18 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
     T* __restrict__ c, const int size_m, const int size_n, const int size_k,
     const int groups, const int zero_offset, const int* __restrict__ b_q_perm) {
   using E = typename WmmaNative<T>::elem;
+  constexpr int WMMA_TAG = 1;
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
   using V16 = typename WmmaNative<T>::v16;
 
   const int m_tile = blockIdx.y * 16;
   const int n_tile = blockIdx.x * 16;
-  if (m_tile >= size_m || n_tile >= size_n) return;
+  if (m_tile >= size_m || n_tile >= size_n) {
+    if (g_wmma_flight_dev && threadIdx.x == 0)
+      g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
+    return;
+  }
 
   const int lane = threadIdx.x;   // 0..31
   const int lane_lo = lane & 15;  // row index within fragment
@@ -590,6 +606,8 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
       }
     }
   }
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
 }
 
 #else  // non-RDNA3 device pass: empty kernel for symbol parity.
@@ -659,11 +677,18 @@ __global__ void gemm_q4_wmma_kernel_32x16_2w(
     T* __restrict__ c, const int size_m, const int size_n, const int size_k,
     const int groups, const int zero_offset, const int* __restrict__ b_q_perm) {
   using E = typename WmmaNative<T>::elem;
+  constexpr int WMMA_TAG = 2;
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
   using V16 = typename WmmaNative<T>::v16;
 
   const int m_tile = blockIdx.y * 32;  // 32-row stride per block
   const int n_tile = blockIdx.x * 16;
-  if (m_tile >= size_m || n_tile >= size_n) return;
+  if (m_tile >= size_m || n_tile >= size_n) {
+    if (g_wmma_flight_dev && threadIdx.x == 0)
+      g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
+    return;
+  }
 
   const int tid = threadIdx.x;   // 0..63
   const int wave_id = tid >> 5;  // 0 or 1
@@ -837,6 +862,8 @@ __global__ void gemm_q4_wmma_kernel_32x16_2w(
       }
     }
   }
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
 }
 
 #else  // non-RDNA3 device pass: empty kernel for symbol parity.
@@ -919,12 +946,19 @@ __global__ void gemm_q4_wmma_kernel_64x16_4w(
     T* __restrict__ c, const int size_m, const int size_n, const int size_k,
     const int groups, const int zero_offset, const int* __restrict__ b_q_perm) {
   using E = typename WmmaNative<T>::elem;
+  constexpr int WMMA_TAG = 3;
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
   using V16 = typename WmmaNative<T>::v16;
 
   const int m_tile =
       blockIdx.y * 64;  // 64-row stride per block (4 waves × 16M)
   const int n_tile = blockIdx.x * 16;
-  if (m_tile >= size_m || n_tile >= size_n) return;
+  if (m_tile >= size_m || n_tile >= size_n) {
+    if (g_wmma_flight_dev && threadIdx.x == 0)
+      g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
+    return;
+  }
 
   const int tid = threadIdx.x;   // 0..127
   const int wave_id = tid >> 5;  // 0..3
@@ -1093,6 +1127,8 @@ __global__ void gemm_q4_wmma_kernel_64x16_4w(
       }
     }
   }
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
 }
 
 #else  // non-RDNA3 device pass: empty kernel for symbol parity.
@@ -1160,11 +1196,18 @@ __global__ void gemm_q4_wmma_kernel_64x32_4w(
     T* __restrict__ c, const int size_m, const int size_n, const int size_k,
     const int groups, const int zero_offset, const int* __restrict__ b_q_perm) {
   using E = typename WmmaNative<T>::elem;
+  constexpr int WMMA_TAG = 4;
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
   using V16 = typename WmmaNative<T>::v16;
 
   const int m_tile = blockIdx.y * 64;
   const int n_tile = blockIdx.x * 32;  // 32-col stride per block (was 16 in v3)
-  if (m_tile >= size_m || n_tile >= size_n) return;
+  if (m_tile >= size_m || n_tile >= size_n) {
+    if (g_wmma_flight_dev && threadIdx.x == 0)
+      g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
+    return;
+  }
 
   const int tid = threadIdx.x;   // 0..127
   const int wave_id = tid >> 5;  // 0..3
@@ -1345,6 +1388,8 @@ __global__ void gemm_q4_wmma_kernel_64x32_4w(
 
   store_acc(c_acc0, n_tile);
   store_acc(c_acc1, n_tile + 16);
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
 }
 
 #else  // non-RDNA3 device pass: empty kernel for symbol parity.
@@ -1414,11 +1459,18 @@ __global__ void gemm_q4_wmma_kernel_64x64_4w(
     T* __restrict__ c, const int size_m, const int size_n, const int size_k,
     const int groups, const int zero_offset, const int* __restrict__ b_q_perm) {
   using E = typename WmmaNative<T>::elem;
+  constexpr int WMMA_TAG = 5;
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
   using V16 = typename WmmaNative<T>::v16;
 
   const int m_tile = blockIdx.y * 64;
   const int n_tile = blockIdx.x * 64;  // 64-col stride per block
-  if (m_tile >= size_m || n_tile >= size_n) return;
+  if (m_tile >= size_m || n_tile >= size_n) {
+    if (g_wmma_flight_dev && threadIdx.x == 0)
+      g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
+    return;
+  }
 
   const int tid = threadIdx.x;   // 0..127
   const int wave_id = tid >> 5;  // 0..3
@@ -1592,6 +1644,8 @@ __global__ void gemm_q4_wmma_kernel_64x64_4w(
   store_acc(c_acc1, n_tile + 16);
   store_acc(c_acc2, n_tile + 32);
   store_acc(c_acc3, n_tile + 48);
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
 }
 
 // ===========================================================================
@@ -1613,11 +1667,18 @@ __global__ void gemm_q4_wmma_kernel_128x64_k16(
     T* __restrict__ c, const int size_m, const int size_n, const int size_k,
     const int groups, const int zero_offset, const int* __restrict__ b_q_perm) {
   using E = typename WmmaNative<T>::elem;
+  constexpr int WMMA_TAG = 6;
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
   using V16 = typename WmmaNative<T>::v16;
 
   const int m_tile = blockIdx.y * 128;  // 128-row M tile
   const int n_tile = blockIdx.x * 64;
-  if (m_tile >= size_m || n_tile >= size_n) return;
+  if (m_tile >= size_m || n_tile >= size_n) {
+    if (g_wmma_flight_dev && threadIdx.x == 0)
+      g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
+    return;
+  }
 
   const int tid = threadIdx.x;   // 0..255
   const int wave_id = tid >> 5;  // 0..7
@@ -1786,6 +1847,8 @@ __global__ void gemm_q4_wmma_kernel_128x64_k16(
   store_acc(c_acc1, n_tile + 16);
   store_acc(c_acc2, n_tile + 32);
   store_acc(c_acc3, n_tile + 48);
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
 }
 
 // ===========================================================================
@@ -1812,11 +1875,18 @@ __global__ void gemm_q4_wmma_kernel_128x64_k32(
     T* __restrict__ c, const int size_m, const int size_n, const int size_k,
     const int groups, const int zero_offset, const int* __restrict__ b_q_perm) {
   using E = typename WmmaNative<T>::elem;
+  constexpr int WMMA_TAG = 7;
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
   using V16 = typename WmmaNative<T>::v16;
 
   const int m_tile = blockIdx.y * 128;
   const int n_tile = blockIdx.x * 64;
-  if (m_tile >= size_m || n_tile >= size_n) return;
+  if (m_tile >= size_m || n_tile >= size_n) {
+    if (g_wmma_flight_dev && threadIdx.x == 0)
+      g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
+    return;
+  }
 
   const int tid = threadIdx.x;   // 0..255
   const int wave_id = tid >> 5;  // 0..7
@@ -1998,6 +2068,8 @@ __global__ void gemm_q4_wmma_kernel_128x64_k32(
   store_acc(c_acc1, n_tile + 16);
   store_acc(c_acc2, n_tile + 32);
   store_acc(c_acc3, n_tile + 48);
+  if (g_wmma_flight_dev && threadIdx.x == 0)
+    g_wmma_flight_dev[(WMMA_TAG*2+1)*WMMA_FLIGHT_SLOTN + WMMA_FLBLK] = 1;
 }
 
 #else  // non-RDNA3 device pass: empty kernels for symbol parity (covers the
@@ -2067,7 +2139,19 @@ void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
 }
 
 }  // namespace gptq_rdna3_wmma
+
 }  // namespace vllm
+
+// 12.165: install pinned-host flight planes (int32, >= 14*WMMA_FLIGHT_SLOTN).
+// At GLOBAL scope so the unqualified extern in common_extension_rocm.cc
+// (_Z15wmma_flight_set...) mangles to the same name.
+void wmma_flight_set(torch::Tensor t) {
+  TORCH_CHECK(t.is_contiguous() && t.scalar_type() == torch::kInt,
+              "wmma flight planes must be contiguous int32");
+  int32_t* p = static_cast<int32_t*>(t.data_ptr());
+  hipMemcpyToSymbol(HIP_SYMBOL(vllm::gptq_rdna3_wmma::g_wmma_flight_dev),
+                    &p, sizeof(p));
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point.
