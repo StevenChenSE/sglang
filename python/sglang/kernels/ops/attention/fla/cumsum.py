@@ -50,12 +50,14 @@ def chunk_local_cumsum_scalar_kernel(
             if (i_t == 0) and (i_bh == 0):
                 tl.store(rec_ring + rec_slot * 32 + 24, 1)
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         if not (
             (i_n >= 0) & (i_n < num_seqs) & (bos >= 0) & (bos <= eos) & (eos <= T)
         ):
@@ -95,10 +97,9 @@ def chunk_local_cumsum_scalar_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BS": BS}, num_warps=num_warps)
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
     ],
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
 )
@@ -131,12 +132,14 @@ def chunk_local_cumsum_vector_kernel(
             if (i_s == 0) and (i_t == 0) and (i_bh == 0):
                 tl.store(rec_ring + rec_slot * 32 + 24, 1)
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         if not (
             (i_n >= 0) & (i_n < num_seqs) & (bos >= 0) & (bos <= eos) & (eos <= T)
         ):
@@ -215,9 +218,9 @@ def chunk_local_cumsum_scalar(
         B, H, T = g.shape
     else:
         B, T, H = g.shape
-    assert chunk_size == 2 ** (
-        chunk_size.bit_length() - 1
-    ), "chunk_size must be a power of 2"
+    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
+        "chunk_size must be a power of 2"
+    )
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -269,9 +272,9 @@ def chunk_local_cumsum_vector(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2 ** (
-        chunk_size.bit_length() - 1
-    ), "chunk_size must be a power of 2"
+    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
+        "chunk_size must be a power of 2"
+    )
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
@@ -320,9 +323,9 @@ def chunk_local_cumsum(
     **kwargs,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
-        assert (
-            g.shape[0] == 1
-        ), "Only batch size 1 is supported when cu_seqlens are provided"
+        assert g.shape[0] == 1, (
+            "Only batch size 1 is supported when cu_seqlens are provided"
+        )
     if len(g.shape) == 3:
         return chunk_local_cumsum_scalar(
             g=g,

@@ -93,9 +93,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if (i_v == 0) and (i_nh == 0):
                 tl.store(rec_ring + rec_slot * 32 + 24, 1)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         if not ((bos >= 0) & (bos <= eos) & (eos <= T)):
             tl.store(witness + 0, 1)
             tl.store(witness + 1, 2000000 + bos)
@@ -357,9 +358,9 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert not (
-        use_exp2 and g is not None
-    ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    assert not (use_exp2 and g is not None), (
+        "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE

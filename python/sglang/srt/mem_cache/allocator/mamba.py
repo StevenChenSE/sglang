@@ -46,20 +46,13 @@ def _guard_violation(site: str, detail: str):
 
 
 class MambaSlotAllocator:
-    """Manages the free-list of Mamba pool slot indices.
-
-    Unlike ``BaseTokenToKVPoolAllocator`` which is designed for per-token KV
-    pages, Mamba slots are request-level (typically 1 slot per request).
-    We keep the interface minimal and do NOT inherit the KV base class.
-    """
+    """Free-list of Mamba pool slot indices. Deliberately not a subclass of
+    ``BaseTokenToKVPoolAllocator``: slots are per request, not per token."""
 
     def __init__(self, size: int, device: str):
         self.size = size
         self.device = device
-        # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
-        # When non-None, `alloc(1)` consumes the next slot from this iterator
-        # instead of calling `_do_alloc(1)` per request. Reset to None outside
-        # a group window so `alloc` falls through to the per-call path.
+        # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
         # SGL_MAMBA_ALLOC_GUARD=1: track occupancy so free()/alloc() catch
         # double frees, out-of-range ids, and duplicate handouts at the exact
@@ -76,10 +69,8 @@ class MambaSlotAllocator:
         return len(self.free_slots)
 
     def schedulable_available_size(self) -> int:
-        """Planner-facing free count. Identity to ``available_size`` for the
-        static pool (slot-count and byte-coordinated views coincide); the shared
-        ``UnifiedMambaSlotAllocator`` overrides it with the byte-coordinated view.
-        Lets ``alloc_req_slots`` call it uniformly without a getattr fallback."""
+        """Planner-facing free count. Same as ``available_size`` for a static pool;
+        byte-coordinated allocators return their byte-limited view instead."""
         return self.available_size()
 
     def alloc_group_begin(self, num_reqs: int):
