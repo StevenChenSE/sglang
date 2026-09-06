@@ -40,7 +40,9 @@ except ImportError as e:
 _RDNA_CUSTOM_AR = os.environ.get("SGLANG_RDNA_CUSTOM_AR", "0") == "1"
 if _RDNA_CUSTOM_AR:
     try:
-        sys.path.insert(0, "scripts/rdna_ar")
+        _rdna_ar_path = os.environ.get("SGLANG_RDNA_AR_PATH")
+        if _rdna_ar_path and os.path.isdir(_rdna_ar_path):
+            sys.path.insert(0, _rdna_ar_path)
         import rdna_ar_ext as _custom_ar  # type: ignore[no-redef]
 
         IS_CUSTOM_AR_AVAILABLE = True
