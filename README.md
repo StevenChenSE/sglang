@@ -133,7 +133,8 @@ python -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --cuda-graph-bs-decode 1 2 4 \
-  --triton-attention-num-kv-splits 16
+  --triton-attention-num-kv-splits 16 \
+  --sleep-on-idle
 ```
 
 ---
