@@ -199,3 +199,35 @@ python -m sglang.launch_server \
    - 推荐仅对 Decode 阶段录制 CUDA 图（`--cuda-graph-bs-decode 1 2 4`）。在 24GB 显存显卡上切勿启用 Prefill 阶段图捕获，以防启动显存不足。
 3. **Mamba 循环状态显存优化**：
    - Mamba 状态缓存按并发数预分配。单人 Agent 使用场景下，设置 `--max-running-requests 4` 与 `--max-mamba-cache-size 20` 可释放单卡约 **2.6 GB 显存**，直接将 BF16 窗口推至 **192k (196,608 tokens)**。
+
+---
+
+## ROCm Linux KFD 事件版本号忙等待修复 (`scripts/rdna_ar/kfd_event_age_fix.c`)
+
+在现代 Linux 内核 (KFD ABI 1.14+) 搭配 ROCm 6.x/7.x 运行时，即使服务完全处于空闲状态无任何流量，系统也常出现**两颗 CPU 核心被 100% 满载打满**的现象。
+
+### 根本原因
+1. **SGLang 调度循环轮询**：默认情况下 SGLang 调度主循环持续主动轮询请求。开启 `--sleep-on-idle` 会激活 ZMQ 套接字等待（`IdleSleeper`），将 Python 调度进程在空闲时的 CPU 占用降至 0%。
+2. **ROCR 运行时 Event Age 状态脱节 Bug**：开启 `--sleep-on-idle` 后，每张 GPU 仍会有 1 个 ROCm 原生后台线程 (`libhsa-runtime64.so` 中的 `AsyncEventsLoop`) 保持 100% CPU 满载。
+   - Linux KFD ABI 1.14+ 引入了单调递增的 `event_age` 机制，用于防止多等待者线程漏掉事件通知。
+   - 上游 ROCR 运行时在调用 `AMDKFD_IOC_WAIT_EVENTS` 前，将栈上的 `event_age` 硬编码/重置为 `1`。一旦 GPU 触发过硬件事件，内核内部维护的 `ev->event_age >= 2`。
+   - Linux 内核驱动判定 `ev->event_age != last_event_age`，立即将事件置为已就绪 (`KFD_IOC_WAIT_RESULT_COMPLETE`) 并在 3 微秒内返回用户态。
+   - 用户态紧接着再次循环，导致单卡每秒产生 **~340 万次系统调用**，单核 CPU 被完全占满。
+
+### 解决方案
+我们在 `scripts/rdna_ar/kfd_event_age_fix.c` 提供了零性能开销的动态链接拦截垫片（Interposer Shim）：
+- 拦截 `ioctl(AMDKFD_IOC_WAIT_EVENTS)`。
+- 在用户态使用无锁缓存记录内核返回的最新 `last_event_age`。
+- 在下一次调用内核前自动填入同步后的版本号，使 Linux AMDKFD 内核驱动正确进入深度休眠 (`schedule_timeout`)。
+- **效果**：两张 GPU 对应的后台空闲线程 CPU 占用直接由 **100% 降至 0.0%**，无需修改系统软件包或重编 ROCm / PyTorch。
+
+编译垫片：
+```bash
+make -C scripts/rdna_ar
+```
+
+通过环境变量注入：
+```bash
+export LD_PRELOAD="scripts/rdna_ar/vendor/kfd_event_age_fix.so:$LD_PRELOAD"
+```
+

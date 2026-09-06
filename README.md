@@ -202,3 +202,35 @@ All tests conducted on 2x AMD Radeon RX 7900 XTX (TP=2) with Qwen3.8-27B-W4A16.
    - Pre-capture decode CUDA graphs (`--cuda-graph-bs-decode 1 2 4`). Do not enable breakable prefill capture on 24GB cards as it leaves minimal VRAM headroom at startup.
 3. **Mamba Recurrent Memory Headroom**:
    - Mamba state cache allocates scratch buffers scaled to concurrency. For single-user agentic setups (concurrency $\le 4$), capping `--max-running-requests 4` and `--max-mamba-cache-size 20` frees **~2.6 GB VRAM per GPU**, allowing context expansion up to **192k** in BF16.
+
+---
+
+## ROCm Linux KFD Event-Age Busy-Wait Fix (`scripts/rdna_ar/kfd_event_age_fix.c`)
+
+When running ROCm 6.x/7.x on modern Linux kernels (KFD ABI 1.14+), you may notice **two CPU cores permanently pinned at 100% utilization** even when the server is completely idle without any incoming requests.
+
+### Root Cause
+1. **SGLang Scheduler Spin**: By default, SGLang's scheduler main loop polls active requests continuously. Adding `--sleep-on-idle` enables ZMQ socket polling (`IdleSleeper`), which drops the Python scheduler process to 0% idle CPU.
+2. **ROCR Runtime Event Age Desynchronization**: Even with `--sleep-on-idle`, ROCm's runtime thread (`AsyncEventsLoop` in `libhsa-runtime64.so`) remains pegged at 100% CPU per GPU.
+   - In Linux KFD ABI 1.14+, `AMDKFD_IOC_WAIT_EVENTS` uses a monotonic `event_age` counter to prevent missing event wakeups across multi-waiter threads.
+   - Upstream ROCR runtime resets `event_age = 1` on the stack before invoking the ioctl. Once any GPU event has fired, the kernel's internal `ev->event_age >= 2`.
+   - The kernel driver observes `ev->event_age != last_event_age` and immediately marks the event as completed (`KFD_IOC_WAIT_RESULT_COMPLETE`), returning in ~3 microseconds.
+   - Userspace loops endlessly, issuing **~3.4 million ioctls per second per GPU** in pure idle.
+
+### Resolution
+We provide a zero-overhead C interposer shim (`scripts/rdna_ar/kfd_event_age_fix.c`):
+- Intercepts `ioctl(AMDKFD_IOC_WAIT_EVENTS)`.
+- Maintains a lock-free cache of the true kernel `last_event_age` per `event_id` in userspace.
+- Supplies matching ages to AMDKFD, allowing the kernel to place the thread into true sleep (`schedule_timeout`).
+- **Result**: Background idle thread CPU drops from **100% to 0.0%** per GPU without touching system packages or recompiling ROCm/PyTorch.
+
+Build the shim:
+```bash
+make -C scripts/rdna_ar
+```
+
+Load via environment variable:
+```bash
+export LD_PRELOAD="scripts/rdna_ar/vendor/kfd_event_age_fix.so:$LD_PRELOAD"
+```
+
