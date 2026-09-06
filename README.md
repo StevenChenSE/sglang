@@ -163,6 +163,19 @@ All tests conducted on 2x AMD Radeon RX 7900 XTX (TP=2) with Qwen3.8-27B-W4A16.
 | **MATH-500 #2** | 212 | 0.137s | 533.3 | **111.2 tok/s** | 100% |
 | **Average** | — | **0.159s** | **562.5** | **110.3 tok/s** | **100%** |
 
+### 4. High Concurrency Throughput ($c=4$)
+*Benchmarked via `llama-benchy` across concurrent streams ($PP=2048, TG=128$, Depth 0)*
+
+| Serving Engine | Concurrency | Total PP Throughput | Total TG Throughput | Peak TG Throughput | Stability Notes |
+|---|:---:|:---:|:---:|:---:|---|
+| **SGLang MTP-3 (This Fork)** | **c = 4** | **1,974.5 tok/s** | **147.5 tok/s** | **206.0 tok/s** | **100% stable**, decode CUDA graphs + MTP-3 active |
+| **vLLM Baseline (No Spec)** | c = 4 | 1,891.1 tok/s | 83.1 tok/s | 180.0 tok/s | Reliable baseline, but slow decode throughput |
+| **vLLM DFlash2** | c = 4 | 1,693.2 tok/s | 75.9 tok/s | 188.0 tok/s | Speculative overhead reduces aggregate TG vs baseline |
+| **vLLM MTP-3** | c = 4 | — | *(Crashed)* | — | Fails under batch > 1 (`hipErrorIllegalAddress`) |
+| **llama.cpp (MTP)** | c = 4 | 636.3 tok/s | 50.1 tok/s | — | Bottlenecked by slot queuing (`-np 2`) |
+
+> **Key Concurrency Takeaway**: While earlier vLLM setups struggled with multi-stream speculative verification on ROCm (crashing or yielding lower aggregate generation speed than baseline autoregression), SGLang's wave-aligned Triton decode graphs and isolated Mamba intermediate buffers deliver **147.5 tok/s aggregate decode throughput** under 4 concurrent streams — **+77.5% faster than vLLM baseline** and **+94.4% faster than vLLM DFlash2**.
+
 ---
 
 ## Key Operational Gotchas & Guidelines
