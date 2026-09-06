@@ -87,6 +87,15 @@ cd sglang/python
 pip install --no-build-isolation --no-deps -e .
 ```
 
+### 3. Build Standalone RDNA Custom All-Reduce Extension (Optional but Recommended)
+RDNA3 GPUs lack CDNA MUBUF/peer-IPC hardware pathways. SGLang provides a standalone one-shot custom all-reduce kernel optimized for gfx1100 PCIe peer access under `scripts/rdna_ar`:
+
+```bash
+# Pre-build and seed the RDNA custom all-reduce shared object into scripts/rdna_ar/vendor
+python sglang/scripts/rdna_ar/rdna_ar_ext.py
+```
+*Note: When `SGLANG_RDNA_CUSTOM_AR=1` is set, SGLang will auto-discover `sglang/scripts/rdna_ar` or look at `SGLANG_RDNA_AR_PATH` if specified. Pre-building ensures fast worker start without JIT compilation delays.*
+
 ---
 
 ## How to Run
@@ -100,6 +109,8 @@ export SGL_RDNA_CUSTOM_AR=1
 export SGL_RDNA_NO_FUSED=1
 export SGL_RDNA_GEMMA_TRITON=1
 export SGL_RDNA_VLLM_VERIFY=1
+# Optional: path to standalone RDNA custom allreduce extension if not in PYTHONPATH
+export SGLANG_RDNA_AR_PATH=/path/to/rdna_ar
 
 python -m sglang.launch_server \
   --model-path /path/to/qwen3.8-27b-mtp-fixed \

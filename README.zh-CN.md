@@ -86,6 +86,15 @@ cd sglang/python
 pip install --no-build-isolation --no-deps -e .
 ```
 
+### 3. 编译独立的 RDNA Custom All-Reduce 扩展（可选推荐）
+RDNA3 架构缺少 CDNA 专属的 MUBUF / peer-IPC 硬件集合通信，本仓库在 `scripts/rdna_ar` 提供了针对 gfx1100 优化的一阶段点对点 PCIe 极速 All-Reduce 算子：
+
+```bash
+# 预编译并将 .so 动态库持久化缓存至 scripts/rdna_ar/vendor/
+python sglang/scripts/rdna_ar/rdna_ar_ext.py
+```
+*注：当设置环境变量 `SGLANG_RDNA_CUSTOM_AR=1` 时，SGLang 会自动查找源码树内的 `sglang/scripts/rdna_ar`（或通过 `SGLANG_RDNA_AR_PATH` 指定自定义路径）。预编译可避免服务冷启动时的 JIT 编译开销。*
+
 ---
 
 ## 生产启动命令

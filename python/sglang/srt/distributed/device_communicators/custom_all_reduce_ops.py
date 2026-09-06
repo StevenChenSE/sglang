@@ -41,6 +41,15 @@ _RDNA_CUSTOM_AR = os.environ.get("SGLANG_RDNA_CUSTOM_AR", "0") == "1"
 if _RDNA_CUSTOM_AR:
     try:
         _rdna_ar_path = os.environ.get("SGLANG_RDNA_AR_PATH")
+        if not _rdna_ar_path or not os.path.isdir(_rdna_ar_path):
+            _in_tree = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "../../../../../scripts/rdna_ar",
+                )
+            )
+            if os.path.isdir(_in_tree):
+                _rdna_ar_path = _in_tree
         if _rdna_ar_path and os.path.isdir(_rdna_ar_path):
             sys.path.insert(0, _rdna_ar_path)
         import rdna_ar_ext as _custom_ar  # type: ignore[no-redef]
