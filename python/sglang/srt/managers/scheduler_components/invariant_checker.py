@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
-import time
-import traceback
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
@@ -24,6 +21,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -72,7 +70,6 @@ class SchedulerInvariantChecker:
     get_chunked_req: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
-    mamba_leak_strikes: int = 0
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -156,6 +153,15 @@ class SchedulerInvariantChecker:
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
+        if is_swa_req_ring(allocator):
+            # Per-request SWA ring: there is no token pool to conserve; ring-slot
+            # leaks are caught by the req_to_token check instead.
+            return False, (
+                "[swa] unified ring (leak-check skipped): "
+                f"available={ps.swa_available_size}, "
+                f"evictable={ps.swa_evictable_size}, "
+                f"total={self.swa_tokens_per_layer}"
+            )
         swa_available = ps.swa_available_size
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
             # Tri-pool: same floating-boundary phantom as the full pool -- use the
@@ -316,13 +322,6 @@ class SchedulerInvariantChecker:
         swa_leak, swa_msg = False, ""
         if self.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
-
-        # NOTE: the mamba identity (available+evictable+protected+session_held
-        # == size) is NOT busy-safe: session_held does not count slots held by
-        # running requests (active + ping-pong track slots), and a finished
-        # request's slots sit in a lazy-return limbo until the next boundary
-        # reclaim. It is only meaningful in the idle path (_check_all_pools),
-        # where the pool has settled.
 
         level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
         full_line = f"[Mem Check (BUSY)] {full_msg}"

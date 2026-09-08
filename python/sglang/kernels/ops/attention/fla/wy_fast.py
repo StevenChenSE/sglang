@@ -9,8 +9,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
-from sglang.kernels.ops.attention.fla.flight_recorder import record, record_with_ring
-from sglang.kernels.ops.attention.fla.utils import get_witness
 
 
 # @triton.autotune(
@@ -32,8 +30,6 @@ def recompute_w_u_fwd_kernel(
     g,
     cu_seqlens,
     chunk_indices,
-    num_seqs,
-    witness,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -43,15 +39,9 @@ def recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    rec_ring=None,
-    rec_slot=-1,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
-    if rec_ring:
-        if rec_slot >= 0:
-            if (i_t == 0) and (i_bh == 0):
-                tl.store(rec_ring + rec_slot * 32 + 24, 1)
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -61,13 +51,6 @@ def recompute_w_u_fwd_kernel(
             tl.load(cu_seqlens + i_n).to(tl.int32),
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
-        if not (
-            (i_n >= 0) & (i_n < num_seqs) & (bos >= 0) & (bos <= eos) & (eos <= T)
-        ):
-            tl.store(witness + 0, 3)
-            tl.store(witness + 1, i_n)
-            tl.store(witness + 2, bos)
-            return
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -126,11 +109,6 @@ def recompute_w_u_fwd_kernel(
         b_w = tl.dot(b_A, b_kb)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
-    if rec_ring:
-        if rec_slot >= 0:
-            if (i_t == 0) and (i_bh == 0):
-                tl.store(rec_ring + rec_slot * 32 + 25, 1)
-
 
 def recompute_w_u_fwd(
     k: torch.Tensor,
@@ -152,9 +130,6 @@ def recompute_w_u_fwd(
     BV = 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
-    ring, rslot = record_with_ring(23, (k, v, beta, w, u, A, g_cumsum, cu_seqlens), (T, NT), name="recompute_w_u")
-    if ring is None:
-        ring, rslot = k, -1
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
         v=v,
@@ -165,10 +140,6 @@ def recompute_w_u_fwd(
         g=g_cumsum,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        num_seqs=(len(cu_seqlens) - 1 if cu_seqlens is not None else B),
-        witness=get_witness(k.device),
-        rec_ring=ring,
-        rec_slot=rslot,
         T=T,
         H=H,
         Hg=Hg,

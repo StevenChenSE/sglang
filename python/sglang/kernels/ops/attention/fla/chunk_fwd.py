@@ -7,10 +7,8 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import safe_exp
-from sglang.kernels.ops.attention.fla.flight_recorder import record, record_with_ring
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
-    get_witness,
     is_tf32_supported,
 )
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
@@ -46,8 +44,6 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     A,
     cu_seqlens,
     chunk_indices,
-    num_seqs,
-    witness,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -57,8 +53,6 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     BK: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    rec_ring=None,
-    rec_slot=-1,
 ):
     """
     Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
@@ -76,11 +70,6 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
 
-    if rec_ring:
-        if rec_slot >= 0:
-            if (i_t == 0) and (i_bh == 0):
-                tl.store(rec_ring + rec_slot * 32 + 24, 1)
-
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -90,13 +79,6 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
             tl.load(cu_seqlens + i_n).to(tl.int32),
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
-        if not (
-            (i_n >= 0) & (i_n < num_seqs) & (bos >= 0) & (bos <= eos) & (eos <= T)
-        ):
-            tl.store(witness + 0, 2)
-            tl.store(witness + 1, i_n)
-            tl.store(witness + 2, bos)
-            return
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -355,11 +337,6 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     tl.store(p_A32, b_Ai32.to(A.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), boundary_check=(0, 1))
 
-    if rec_ring:
-        if rec_slot >= 0:
-            if (i_t == 0) and (i_bh == 0):
-                tl.store(rec_ring + rec_slot * 32 + 25, 1)
-
 
 def chunk_gated_delta_rule_fwd_intra(
     k: torch.Tensor,
@@ -413,9 +390,6 @@ def chunk_gated_delta_rule_fwd_intra(
 
     # Step 1: fused kkt + solve_tril
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
-    ring, rslot = record_with_ring(22, (k, g, beta, A, cu_seqlens, chunk_indices), (T, NT), name="kkt_solve")
-    if ring is None:
-        ring, rslot = k, -1
     chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
         k=k,
         g=g,
@@ -423,10 +397,6 @@ def chunk_gated_delta_rule_fwd_intra(
         A=A,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        num_seqs=(len(cu_seqlens) - 1 if cu_seqlens is not None else B),
-        witness=get_witness(k.device),
-        rec_ring=ring,
-        rec_slot=rslot,
         T=T,
         H=H,
         Hg=Hg,

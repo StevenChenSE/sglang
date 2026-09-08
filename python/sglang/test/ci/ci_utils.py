@@ -417,8 +417,28 @@ def run_unittest_files(
 
         if not file_passed:
             success = False
-            if not continue_on_error:
-                break
+
+        # Flush per-file so a SIGKILL mid-suite still surfaces completed files.
+        metrics_path = os.environ.get("SGLANG_TEST_METRICS_FILE")
+        if metrics_path and filename in file_elapsed:
+            try:
+                incremental_record = {
+                    "kind": "file",
+                    "test_file": os.path.basename(filename),
+                    "status": "pass" if file_passed else "fail",
+                    "duration": round(file_elapsed[filename], 2),
+                }
+                if not file_passed:
+                    reason = next((r for f, r in failed_tests if f == filename), None)
+                    if reason:
+                        incremental_record["error"] = reason
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(incremental_record) + "\n")
+            except OSError:
+                pass
+
+        if not file_passed and not continue_on_error:
+            break
 
     if fork_worker is not None:
         fork_worker.close()

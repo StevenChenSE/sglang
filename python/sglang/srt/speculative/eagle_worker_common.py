@@ -16,7 +16,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.phase_timer import get_phase_timer
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
@@ -103,26 +102,6 @@ def duplicate_prefix_tail_to_draft_branches(
         token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
 
 
-_de_prof_state = {"n": 0, "prof": None}
-
-
-def _de_profile_maybe():
-    # JOURNAL 12.100: env-toggled cProfile scoped to prepare_for_draft_extend
-    # (SGLANG_DEPROFILE=1: start at call 60, dump at 120 to /tmp/de_prof.out).
-    import os
-    if os.environ.get("SGLANG_DEPROFILE") != "1":
-        return
-    _de_prof_state["n"] += 1
-    if _de_prof_state["n"] == 60:
-        import cProfile
-        _de_prof_state["prof"] = cProfile.Profile()
-        _de_prof_state["prof"].enable()
-    elif _de_prof_state["n"] == 120 and _de_prof_state["prof"] is not None:
-        _de_prof_state["prof"].disable()
-        _de_prof_state["prof"].dump_stats("/tmp/de_prof.out")
-        _de_prof_state["prof"] = None
-
-
 def prepare_for_draft_extend(
     draft_extend_input: EagleDraftExtendInput,
     batch: ScheduleBatch,
@@ -135,7 +114,6 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
 ):
-    _de_profile_maybe()
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
     # rows below the boundary. Locs/positions arrive precomputed; token/hidden
@@ -509,7 +487,6 @@ def run_eagle_verify(
       this compaction.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
-    _pt = get_phase_timer()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
@@ -517,7 +494,7 @@ def run_eagle_verify(
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
-    with _pt.span("verify_prepare"), plan_stream_ctx:
+    with plan_stream_ctx:
         if plan_stream is not None:
             # Verify prep copies draft-produced tree metadata on the plan stream,
             # so it must not start before the draft frontier.
@@ -587,12 +564,11 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    with _pt.span("verify_target"):
-        forward_batch_output = target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-        )
+    forward_batch_output = target_worker.forward_batch_generation(
+        batch=None,
+        forward_batch=verify_forward_batch,
+        is_verify=True,
+    )
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
@@ -620,77 +596,76 @@ def run_eagle_verify(
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
     )
-    with _pt.span("verify_post"):
-        new_seq_lens = batch.seq_lens + accept_lens
-        clear_unaccepted_c128 = getattr(
-            token_to_kv_pool_allocator.get_kvcache(),
-            "clear_unaccepted_c128_draft_states",
-            None,
-        )
-        if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
-            clear_unaccepted_c128(
-                batch.req_pool_indices,
-                batch.seq_lens,
-                accept_lens,
-                num_draft_tokens,
-            )
-
-        # Update mamba state for hybrid GDN models after verification
-        commit_mamba_states_after_verify(
-            target_worker,
-            batch,
+    new_seq_lens = batch.seq_lens + accept_lens
+    clear_unaccepted_c128 = getattr(
+        token_to_kv_pool_allocator.get_kvcache(),
+        "clear_unaccepted_c128_draft_states",
+        None,
+    )
+    if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
+        clear_unaccepted_c128(
+            batch.req_pool_indices,
+            batch.seq_lens,
             accept_lens,
-            accept_index,
             num_draft_tokens,
         )
 
-        if not batch.forward_mode.is_idle():
-            accept_tokens = predict[accept_index]
-            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            # stride = accept_tokens per-req width = accept_index.shape[1]
-            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            fill_bonus_tokens_func(
-                accept_tokens,
-                accept_lens,
-                bonus_tokens,
-                accept_index.shape[1],
-                bs,
-            )
-        else:
-            bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
+    # Update mamba state for hybrid GDN models after verification
+    commit_mamba_states_after_verify(
+        target_worker,
+        batch,
+        accept_lens,
+        accept_index,
+        num_draft_tokens,
+    )
 
-        if batch.return_logprob and not batch.forward_mode.is_idle():
-            compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
-
-        if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
-            # topk == 1 needs nothing here: the accepted path is already the front
-            # chain, so the whole compaction is an identity transform.
-            predict = _finalize_accept_tree_path(
-                batch,
-                accept_index,
-                accept_lens,
-                predict,
-                logits_output,
-                bs,
-                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-                num_draft_tokens=num_draft_tokens,
-            )
-
-        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
-
-        # verify_forward_batch transitively holds verify-time GPU tensors
-        # (draft_token / out_cache_loc / ...) that must outlive the imminent
-        # batch.input_ids rebind in prepare_for_draft_extend.
-        # Scheduler pins it in batch_record_buf for the 2-iter window.
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=predict,
-            can_run_cuda_graph=can_run_cuda_graph,
-            speculative_num_draft_tokens=num_draft_tokens,
-            next_draft_input=next_draft_input,
-            accept_lens=accept_lens,
-            new_seq_lens=new_seq_lens,
-            routed_experts_output=forward_batch_output.routed_experts_output,
-            indexer_topk_output=forward_batch_output.indexer_topk_output,
-            extra_keep_alive_refs=[verify_forward_batch],
+    if not batch.forward_mode.is_idle():
+        accept_tokens = predict[accept_index]
+        bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+        # stride = accept_tokens per-req width = accept_index.shape[1]
+        # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
+        fill_bonus_tokens_func(
+            accept_tokens,
+            accept_lens,
+            bonus_tokens,
+            accept_index.shape[1],
+            bs,
         )
+    else:
+        bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
+
+    if batch.return_logprob and not batch.forward_mode.is_idle():
+        compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
+
+    if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
+        # topk == 1 needs nothing here: the accepted path is already the front
+        # chain, so the whole compaction is an identity transform.
+        predict = _finalize_accept_tree_path(
+            batch,
+            accept_index,
+            accept_lens,
+            predict,
+            logits_output,
+            bs,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            num_draft_tokens=num_draft_tokens,
+        )
+
+    next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+
+    # verify_forward_batch transitively holds verify-time GPU tensors
+    # (draft_token / out_cache_loc / ...) that must outlive the imminent
+    # batch.input_ids rebind in prepare_for_draft_extend.
+    # Scheduler pins it in batch_record_buf for the 2-iter window.
+    return GenerationBatchResult(
+        logits_output=logits_output,
+        next_token_ids=predict,
+        can_run_cuda_graph=can_run_cuda_graph,
+        speculative_num_draft_tokens=num_draft_tokens,
+        next_draft_input=next_draft_input,
+        accept_lens=accept_lens,
+        new_seq_lens=new_seq_lens,
+        routed_experts_output=forward_batch_output.routed_experts_output,
+        indexer_topk_output=forward_batch_output.indexer_topk_output,
+        extra_keep_alive_refs=[verify_forward_batch],
+    )

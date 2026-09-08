@@ -52,7 +52,217 @@ from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestEncoderDPErrorHandling(CustomTestCase):
+    @staticmethod
+    async def _run_registration_error(error):
+        encoder = SimpleNamespace(
+            register_embedding_destinations=AsyncMock(side_effect=error)
+        )
+        send = AsyncMock()
+        request = {
+            "req_id": "req",
+            "receive_count": 1,
+            "receive_url": "tcp://127.0.0.1:1",
+        }
+        with patch.object(encoder_runtime, "async_sock_send", send):
+            await encoder_runtime._dp_worker_handle_request(
+                encoder,
+                None,
+                object(),
+                asyncio.Lock(),
+                0,
+                request,
+                "register_destinations",
+            )
+        return unwrap_from_pickle(send.await_args.args[1])
+
+    def test_worker_reports_third_party_exception_with_callable_code(self):
+        class RpcLikeError(Exception):
+            def code(self):
+                return "INTERNAL"
+
+        envelope = asyncio.run(
+            self._run_registration_error(RpcLikeError("registration failed"))
+        )
+        self.assertEqual(envelope["_error"], "registration failed")
+        self.assertEqual(envelope["_error_code"], 500)
+
+    def test_worker_preserves_mm_error_status(self):
+        envelope = asyncio.run(
+            self._run_registration_error(MMError("bad destination", code=400))
+        )
+        self.assertEqual(envelope["_error_code"], 400)
+
+    def test_dispatcher_drops_malformed_result_without_stopping_listener(self):
+        async def run():
+            dispatcher = encoder_runtime.DPDispatcher(
+                dp_size=1,
+                dispatch_sockets=[object()],
+                release_sockets=[object()],
+                result_socket=object(),
+                worker_processes=[],
+            )
+            future = asyncio.get_running_loop().create_future()
+            dispatcher.pending_futures[0]["req"] = future
+            dispatcher.req_id_to_rank["req"] = 0
+            valid = {"req_id": "req", "_dp_type": "encode", "content": None}
+            recv = AsyncMock(
+                side_effect=[
+                    ["not", "an", "envelope"],
+                    valid,
+                    asyncio.CancelledError(),
+                ]
+            )
+
+            with patch.object(encoder_runtime, "async_sock_recv", recv):
+                listener = asyncio.create_task(dispatcher._result_listener())
+                await asyncio.wait_for(future, timeout=1)
+                listener.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await listener
+
+            self.assertEqual(future.result(), valid)
+
+        asyncio.run(run())
+
+
+class TestEncoderMetaRegistry(CustomTestCase):
+    def test_stale_releases_do_not_block_each_other(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            blocked_started = asyncio.Event()
+            unblock = asyncio.Event()
+            fast_released = asyncio.Event()
+
+            async def release(req_id):
+                if req_id == "blocked":
+                    blocked_started.set()
+                    await unblock.wait()
+                else:
+                    fast_released.set()
+
+            registry.on_release = release
+            registry._pending_at.update(blocked=0, fast=0)
+
+            blocked_task = registry._schedule_stale_release("blocked")
+            await asyncio.wait_for(blocked_started.wait(), timeout=1)
+            fast_task = registry._schedule_stale_release("fast")
+            await asyncio.wait_for(fast_released.wait(), timeout=1)
+            await fast_task
+
+            self.assertIn("blocked", registry._pending_at)
+            self.assertNotIn("fast", registry._pending_at)
+
+            unblock.set()
+            await blocked_task
+            self.assertNotIn("blocked", registry._pending_at)
+
+        asyncio.run(run())
+
+    def test_failed_stale_release_is_retried(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            attempts = 0
+
+            async def release(_req_id):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("transient cleanup failure")
+
+            registry.on_release = release
+            registry._pending_at["req"] = 0
+
+            await registry._release_stale("req")
+            self.assertIn("req", registry._pending_at)
+            retry_at = registry._pending_at["req"]
+            self.assertGreater(retry_at, 0)
+
+            await registry._release_stale("req")
+            self.assertNotIn("req", registry._pending_at)
+            self.assertEqual(attempts, 2)
+
+        asyncio.run(run())
+
+    def test_send_retries_do_not_release_before_all_destinations_finish(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            released = AsyncMock()
+            registry.on_release = released
+
+            await registry.note_send_done("req", 2, "10.0.0.1:5000")
+            await registry.note_send_done("req", 2, "10.0.0.1:5000")
+            released.assert_not_awaited()
+
+            await registry.note_send_done("req", 2, "10.0.0.2:5000")
+            released.assert_awaited_once_with("req")
+
+        asyncio.run(run())
+
+    def test_http_send_counts_the_normalized_destination(self):
+        async def run():
+            send = AsyncMock(return_value=True)
+            note_send_done = AsyncMock()
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+                "receive_count": 2,
+            }
+            with (
+                patch.object(http_server, "dp_dispatcher", None),
+                patch.object(http_server, "encoder", SimpleNamespace(send=send)),
+                patch.object(
+                    encoder_server.meta_registry,
+                    "note_send_done",
+                    note_send_done,
+                ),
+            ):
+                response = await http_server.handle_send_request(request)
+
+            self.assertEqual(response.status_code, 200)
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
+
+        asyncio.run(run())
+
+    def test_dp_send_counts_the_normalized_destination(self):
+        async def run():
+            encoder = SimpleNamespace(send=AsyncMock(return_value=True))
+            note_send_done = AsyncMock()
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+                "receive_count": 2,
+            }
+            with (
+                patch.object(encoder_runtime, "async_sock_send", AsyncMock()),
+                patch.object(
+                    encoder_server.meta_registry,
+                    "note_send_done",
+                    note_send_done,
+                ),
+            ):
+                await encoder_runtime._dp_worker_handle_request(
+                    encoder,
+                    None,
+                    object(),
+                    asyncio.Lock(),
+                    0,
+                    request,
+                    "send",
+                )
+
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
+
+        asyncio.run(run())
 
 
 class TestEncoderDPErrorHandling(CustomTestCase):

@@ -64,21 +64,17 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.enable_unified_memory = model_runner.server_args.enable_unified_memory
+        self.enable_unified_memory = get_memory().enable_unified_memory
         # model_config must not be touched here: backend selection reads the
         # linear_attn_backends stamp first, and that guard test constructs
         # backends on runners without a real model_config.
         self._model_runner = model_runner
         self._mamba_chunk_size: Optional[int] = None
-        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
-        # requires the static hybrid pool whose v2p translate is the identity —
-        # the unified pool overrides translate_mamba_indices with an allocator
-        # lookup that is not a flat table gather.
+        pool = self.req_to_token_pool
         self._fused_state_indices_ok = (
-            str(self.device).startswith("cuda")
-            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
-            and type(self.req_to_token_pool).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
+            torch.device(self.device).type == "cuda"
+            and isinstance(pool, HybridReqToTokenPool)
+            and pool.mamba_translate_is_fusable
         )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -148,39 +144,6 @@ class MambaAttnBackendBase(AttentionBackend):
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
             mamba_cache_indices[_real_bs:] = -1
-
-        # 12.145: host-side pool guard — mamba slot ids feed GDN state kernels
-        # as raw offsets; a stale/corrupt id writes out of bounds. Raise before
-        # launch (never during graph capture: .item() syncs are illegal there).
-        import os as _os
-        from sglang.srt.utils.flight_flags import flag_on
-
-        if (flag_on("POOL_GUARD") or _os.environ.get("SGL_POOL_GUARD")) and not torch.cuda.is_current_stream_capturing():
-            # MambaPool tensors are (size + 1) rows: slot 0 = padding anchor,
-            # id `size` = trailing allocatable row (allocator free list is
-            # arange(1, size+1)). Valid slot ids are [0, size] INCLUSIVE.
-            _mpool_size = int(self.req_to_token_pool.mamba_pool.size) + 1
-            for _name, _t in (
-                ("mamba_cache_indices", mamba_cache_indices),
-                ("mamba_track_indices", forward_batch.mamba_track_indices),
-            ):
-                if _t is None or _t.numel() == 0:
-                    continue
-                _t_f = _t.flatten().to(torch.int64)
-                _mask = _t_f != -1  # -1 = graph-padding sentinel (skipped)
-                if bool(_mask.any()):
-                    _mn = int(_t_f[_mask].min().item())
-                    _mx = int(_t_f[_mask].max().item())
-                    if _mn < 0 or _mx >= _mpool_size:
-                        import traceback as _tb
-                        _head = (
-                            f"POOL GUARD VIOLATION {_name}: min={_mn} max={_mx} "
-                            f"allowed=[0, {_mpool_size})"
-                        )
-                        with open(_os.path.expanduser("~/pool_guard.log"), "a") as _f:
-                            _f.write(f"\n==== {_head}\n")
-                            _f.write("".join(_tb.format_stack()[-30:]) + "\n")
-                        raise RuntimeError(_head)
 
         replayssm_write_pos = None
         replayssm_force_flush = None
@@ -676,6 +639,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 out_state_indices=self.state_indices_list[bs - 1],
                 valid_bs=bs - int(num_padding),
                 total_bs=bs,
+                v2p=self.req_to_token_pool.mamba_v2p_table,
             )
         else:
             # Make sure forward metadata is correctly handled for padding reqs
@@ -962,14 +926,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
 
-        if model_runner.server_args.enable_mamba_extra_buffer():
+        if get_exec().mamba.enable_mamba_extra_buffer:
             assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
                 f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
             )
-            assert (
-                model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
-            ), (
-                f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            assert get_exec().mamba.mamba_track_interval >= self.mamba_chunk_size, (
+                f"mamba_track_interval ({get_exec().mamba.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
             )
 
     def init_forward_metadata_out_graph(

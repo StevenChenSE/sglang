@@ -10,12 +10,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
-from sglang.kernels.ops.attention.fla.flight_recorder import record, record_with_ring
-from sglang.kernels.ops.attention.fla.utils import (
-    check_shared_mem,
-    get_witness,
-    is_nvidia_hopper,
-)
+from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -41,8 +36,6 @@ def chunk_fwd_kernel_o(
     o,
     cu_seqlens,
     chunk_indices,
-    num_seqs,
-    witness,
     scale,
     T,
     H: tl.constexpr,
@@ -54,16 +47,9 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    rec_ring=None,
-    rec_slot=-1,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
-
-    if rec_ring:
-        if rec_slot >= 0:
-            if (i_v == 0) and (i_t == 0) and (i_bh == 0):
-                tl.store(rec_ring + rec_slot * 32 + 24, 1)
 
     if IS_VARLEN:
         i_tg = i_t
@@ -75,13 +61,6 @@ def chunk_fwd_kernel_o(
             tl.load(cu_seqlens + i_n).to(tl.int32),
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
-        if not (
-            (i_n >= 0) & (i_n < num_seqs) & (bos >= 0) & (bos <= eos) & (eos <= T)
-        ):
-            tl.store(witness + 0, 4)
-            tl.store(witness + 1, i_n)
-            tl.store(witness + 2, bos)
-            return
         T = eos - bos
         NT = tl.cdiv(T, BT)
     else:
@@ -145,11 +124,6 @@ def chunk_fwd_kernel_o(
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
-    if rec_ring:
-        if rec_slot >= 0:
-            if (i_v == 0) and (i_t == 0) and (i_bh == 0):
-                tl.store(rec_ring + rec_slot * 32 + 25, 1)
-
 
 def chunk_fwd_o(
     q: torch.Tensor,
@@ -176,9 +150,6 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    ring, rslot = record_with_ring(25, (q, k, v, h, o, cu_seqlens, chunk_indices), (T, NT), name="fwd_o")
-    if ring is None:
-        ring, rslot = q, -1
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -188,11 +159,7 @@ def chunk_fwd_o(
         o,
         cu_seqlens,
         chunk_indices,
-        (len(cu_seqlens) - 1 if cu_seqlens is not None else B),
-        get_witness(q.device),
         scale,
-        rec_ring=ring,
-        rec_slot=rslot,
         T=T,
         H=H,
         Hg=Hg,

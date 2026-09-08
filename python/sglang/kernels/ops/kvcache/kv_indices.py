@@ -19,8 +19,6 @@ def create_flashinfer_kv_indices_triton(
     # (a recompile every few decode steps at small page sizes).
     req_to_token_ptr_stride,
     ENTRY_PAGE_SIZE: tl.constexpr = 1,
-    rec_ring=None,
-    rec_slot=-1,
 ):
     """Gather per-request token ids into a flat CSR kv_indices stream.
 
@@ -33,11 +31,6 @@ def create_flashinfer_kv_indices_triton(
     """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
-
-    if rec_ring:
-        if rec_slot >= 0:
-            if pid == 0:
-                tl.store(rec_ring + rec_slot * 32 + 24, 1)
 
     # find the req pool idx, this is for batch to token
     req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
@@ -73,11 +66,6 @@ def create_flashinfer_kv_indices_triton(
             )
             data = entry.to(tl.int64) * ENTRY_PAGE_SIZE + pos % ENTRY_PAGE_SIZE
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
-
-    if rec_ring:
-        if rec_slot >= 0:
-            if pid == 0:
-                tl.store(rec_ring + rec_slot * 32 + 25, 1)
 
 
 @triton.jit
