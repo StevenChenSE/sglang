@@ -128,6 +128,37 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 
+def _vocab_parallel_top1(logits: torch.Tensor):
+    """Global top-1 over TP-sharded local logits without an all-gather.
+
+    Exchanges only (max_val, global_idx) pairs (8 B/token). Preserves the
+    first-index tie-break across ranks (ties resolve to the lower rank, and
+    within a rank to torch.argmax's local choice). Returns (topk_p, topk_index)
+    matching the eager topk==1 contract: topk_p is ones (unused without
+    rejection sampling).
+    """
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_world_size,
+        get_tp_group,
+    )
+
+    local_idx = logits.argmax(dim=-1, keepdim=True)
+    local_val = logits.gather(-1, local_idx)
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        return torch.ones_like(local_idx, dtype=torch.float32), local_idx
+    local_size = logits.shape[-1]
+    tp = get_tp_group()
+    packed = torch.cat(
+        [local_val, (local_idx + tp.rank * local_size).to(torch.float32)], dim=-1
+    )
+    gathered = tp.all_gather(packed, dim=0).view(tp_size, *local_idx.shape, 2)
+    v0, i0 = gathered[0, :, :, 0], gathered[0, :, :, 1]
+    v1, i1 = gathered[1, :, :, 0], gathered[1, :, :, 1]
+    idx = torch.where(v1 > v0, i1, i0).to(torch.long)
+    return torch.ones_like(idx, dtype=torch.float32), idx
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -217,6 +248,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        _draft_lp = getattr(self.draft_runner.model, "logits_processor", None)
+        self.draft_logits_local = (
+            _is_hip
+            and self.topk == 1
+            and not get_spec().speculative_use_rejection_sampling
+            and _draft_lp is not None
+            and not getattr(_draft_lp, "do_tensor_parallel_all_gather", True)
+        )
+        if self.draft_logits_local:
+            logger.info("draft logits are TP-local: using vocab-parallel top-1")
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -688,6 +729,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
+                # Index domain for the OOB check below: every branch here
+                # produces topk_index within the (gathered or local-full)
+                # next_token_logits, except the vocab-parallel top-1 branch,
+                # which yields GLOBAL vocab indices and overrides this bound.
+                oob_vocab_bound = logits_output.next_token_logits.shape[-1]
                 if get_spec().speculative_use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
@@ -709,6 +755,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         )
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
+                elif self.topk == 1 and self.draft_logits_local:
+                    # Local (skip-all-gather) draft logits: exchange 8-byte
+                    # (max, idx) pairs instead of the full vocab.
+                    topk_p, topk_index = _vocab_parallel_top1(
+                        logits_output.next_token_logits
+                    )
+                    forward_batch.positions.add_(1)
+                    # _vocab_parallel_top1 returns GLOBAL vocab indices
+                    # (local argmax + rank * shard_size, computed without an
+                    # all-gather), so validate against the sum-of-shards
+                    # vocab, not the local shard size — a winning shard on a
+                    # later rank yields indices >= the local shape[-1].
+                    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+                    oob_vocab_bound = (
+                        get_tensor_model_parallel_world_size()
+                        * logits_output.next_token_logits.shape[-1]
+                    )
                 else:
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
@@ -720,8 +783,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    oob_vocab_bound,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={oob_vocab_bound}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -895,19 +958,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        if self.draft_logits_local:
+            # Local (skip-all-gather) draft logits: exchange 8-byte pairs.
+            topk_p, topk_index = _vocab_parallel_top1(logits_output.next_token_logits)
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
-            draft_probs=probs if use_rejection_sampling else None,
+            draft_probs=None
+            if self.draft_logits_local
+            else (probs if use_rejection_sampling else None),
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
@@ -1050,6 +1119,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        elif self.topk == 1 and self.draft_logits_local:
+            ret_topk_p, ret_topk_index = _vocab_parallel_top1(
+                draft_logits_output.next_token_logits
+            )
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(
