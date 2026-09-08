@@ -690,6 +690,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)
+        if forward_batch.forward_mode.is_decode() and self.captured_req_width != 1:
+            return False
+
         spec_info = forward_batch.spec_info
         if (
             spec_info is not None

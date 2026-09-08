@@ -1896,6 +1896,33 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if batch.has_active_mm_inputs():
+                saved_spec_info = batch.spec_info
+                batch.spec_info = None
+                try:
+                    batch_output = self.target_worker.forward_batch_generation(
+                        batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                    )
+                finally:
+                    batch.spec_info = saved_spec_info
+
+                logits_output, next_token_ids = (
+                    batch_output.logits_output,
+                    batch_output.next_token_ids,
+                )
+                self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
+                new_seq_lens = batch.seq_lens
+                batch_output.new_seq_lens = new_seq_lens
+                if on_publish is not None:
+                    on_publish(batch_output.new_seq_lens)
+                batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                    bonus_tokens=next_token_ids,
+                    seq_lens=new_seq_lens,
+                )
+                return batch_output
+
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -1995,6 +2022,56 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+
+        if batch.has_active_mm_inputs():
+            # In decode mode with active multimodal inputs (fallback guard):
+            # Bypass DFlash drafting and target-verify. Fall back to standard eager decode (1 token).
+            block_size = int(self.block_size)
+            decode_out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + 1,
+                batch_size=bs,
+                draft_token_num=1,
+                device=device,
+            )
+            batch.out_cache_loc = decode_out_cache_loc
+            batch.forward_mode = ForwardMode.DECODE
+            batch.input_ids = draft_input.bonus_tokens.view(-1)
+            saved_spec_info = batch.spec_info
+            batch.spec_info = None
+            try:
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    is_verify=False,
+                )
+            finally:
+                batch.spec_info = saved_spec_info
+
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, batch_output.next_token_ids)
+            new_seq_lens = batch.seq_lens + 1
+            if on_publish is not None:
+                on_publish(new_seq_lens)
+
+            out_tokens = torch.zeros((bs, block_size), dtype=torch.int64, device=device)
+            out_tokens[:, 0] = batch_output.next_token_ids
+            commit_lens = torch.ones((bs,), dtype=torch.int32, device=device)
+            next_draft_input = self._make_next_draft_input_decode(
+                bonus_tokens=batch_output.next_token_ids,
+                new_seq_lens=new_seq_lens,
+            )
+            return GenerationBatchResult(
+                logits_output=batch_output.logits_output,
+                next_token_ids=out_tokens.reshape(-1),
+                accept_lens=commit_lens,
+                next_draft_input=next_draft_input,
+                can_run_cuda_graph=False,
+                speculative_num_draft_tokens=block_size,
+                new_seq_lens=new_seq_lens,
+            )
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model

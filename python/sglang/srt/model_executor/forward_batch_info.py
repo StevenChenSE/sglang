@@ -1141,20 +1141,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_positions = batch.spec_info.positions
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
-        if all(mm_input is None for mm_input in mm_inputs):
+        if mm_inputs is None or all(mm_input is None for mm_input in mm_inputs):
             mrope_delta_tensor = torch.zeros(
                 (batch_size, 1), dtype=torch.int64, device=device
             )
         else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
-                )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            mrope_deltas = []
+            for i in range(batch_size):
+                if (
+                    i < len(mm_inputs)
+                    and mm_inputs[i] is not None
+                    and getattr(mm_inputs[i], "mrope_position_delta", None) is not None
+                ):
+                    delta = mm_inputs[i].mrope_position_delta.view(-1)[:1]
+                    mrope_deltas.append(delta.to(device=device, dtype=torch.int64))
+                else:
+                    mrope_deltas.append(torch.zeros(1, dtype=torch.int64, device=device))
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
@@ -1208,8 +1211,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
         seq_lens_cpu = self.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = self.seq_lens.to("cpu")
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
+        if mm_inputs is None:
+            mm_inputs = [None] * batch_size
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         seq_lens_int64 = self.seq_lens.to(torch.int64)
 
@@ -1274,8 +1281,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
         seq_lens_cpu = self.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = self.seq_lens.to("cpu")
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
+        if mm_inputs is None:
+            mm_inputs = [None] * batch_size
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens

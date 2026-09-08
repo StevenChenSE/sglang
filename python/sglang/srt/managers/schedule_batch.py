@@ -2429,6 +2429,110 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         previous batch's result is resolved before this forward."""
         return self.has_grammar and not self.spec_algorithm.supports_grammar_overlap()
 
+    def contains_image_inputs(self) -> bool:
+        if self.multimodal_inputs is not None:
+            if any(
+                mm is not None and getattr(mm, "contains_image_inputs", lambda: False)()
+                for mm in self.multimodal_inputs
+            ):
+                return True
+        if self.reqs:
+            if any(
+                req.multimodal_inputs is not None
+                and getattr(req.multimodal_inputs, "contains_image_inputs", lambda: False)()
+                for req in self.reqs
+            ):
+                return True
+        return False
+
+    def has_active_image_inputs(self) -> bool:
+        """Check if this batch is actively processing image tokens in the current extend pass."""
+        if not (self.forward_mode.is_extend(include_draft_extend_v2=True) or self.is_extend_in_batch):
+            return False
+        if not self.reqs:
+            return False
+        for req in self.reqs:
+            mm = req.multimodal_inputs
+            if mm is None:
+                continue
+            if not getattr(mm, "contains_image_inputs", lambda: False)():
+                continue
+            if req.extend_range is None:
+                return True
+            ext_start = req.extend_range.start
+            ext_end = req.extend_range.end
+            mm_items = getattr(mm, "mm_items", None)
+            if not mm_items:
+                return True
+            for item in mm_items:
+                if not getattr(item, "is_valid", lambda: True)():
+                    continue
+                if not getattr(item, "is_image", lambda: False)():
+                    continue
+                offsets = getattr(item, "offsets", None)
+                if not offsets:
+                    return True
+                for img_start, img_end in offsets:
+                    if max(ext_start, img_start) < min(ext_end, img_end + 1):
+                        return True
+        return False
+
+    def has_active_mm_inputs(self) -> bool:
+        """Check if this batch is actively processing multimodal tokens in the current extend pass."""
+        if not (self.forward_mode.is_extend(include_draft_extend_v2=True) or self.is_extend_in_batch):
+            return False
+        if not self.reqs:
+            return False
+        for req in self.reqs:
+            mm = req.multimodal_inputs
+            if mm is None:
+                continue
+            if not (
+                getattr(mm, "contains_mm_input", lambda: False)()
+                or getattr(mm, "contains_image_inputs", lambda: False)()
+            ):
+                continue
+            if req.extend_range is None:
+                return True
+            ext_start = req.extend_range.start
+            ext_end = req.extend_range.end
+            mm_items = getattr(mm, "mm_items", None)
+            if not mm_items:
+                return True
+            for item in mm_items:
+                if not getattr(item, "is_valid", lambda: True)():
+                    continue
+                offsets = getattr(item, "offsets", None)
+                if not offsets:
+                    return True
+                for mm_start, mm_end in offsets:
+                    if max(ext_start, mm_start) < min(ext_end, mm_end + 1):
+                        return True
+        return False
+
+    def contains_mm_inputs(self) -> bool:
+        if self.multimodal_inputs is not None:
+            if any(
+                mm is not None
+                and (
+                    getattr(mm, "contains_mm_input", lambda: False)()
+                    or getattr(mm, "contains_image_inputs", lambda: False)()
+                )
+                for mm in self.multimodal_inputs
+            ):
+                return True
+        if self.reqs:
+            if any(
+                req.multimodal_inputs is not None
+                and (
+                    getattr(req.multimodal_inputs, "contains_mm_input", lambda: False)()
+                    or getattr(req.multimodal_inputs, "contains_image_inputs", lambda: False)()
+                )
+                for req in self.reqs
+            ):
+                return True
+        return False
+
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
     ):
@@ -3634,6 +3738,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
+            multimodal_inputs=self.multimodal_inputs,
         )
 
     def maybe_evict_swa(self):
