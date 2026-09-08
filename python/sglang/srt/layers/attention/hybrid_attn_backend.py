@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 class HybridAttnBackend(AttentionBackend):
     """Support different backends for prefill and decode."""
 
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,

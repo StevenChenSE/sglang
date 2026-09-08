@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils.common import is_rdna_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -475,8 +476,10 @@ class FutureMap:
         if n == 0:
             return
         if self.publish_ready is not None:
-            if _is_hip:
+            if _is_hip and not is_rdna_supported():
                 self.publish_ready.synchronize()
+            elif _is_hip and is_rdna_supported():
+                torch.cuda.current_stream().wait_event(self.publish_ready)
             else:
                 self.publish_ready.wait()
         fresh = self.new_seq_lens_buf[idx]
@@ -527,9 +530,11 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if _is_hip and not is_rdna_supported():
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
+            elif _is_hip and is_rdna_supported():
+                torch.cuda.current_stream().wait_event(self.publish_ready)
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]

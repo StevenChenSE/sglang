@@ -215,7 +215,7 @@ def apply_rdna_fused_ar_rmsnorm(input_tensor: torch.Tensor):
     # (plain AR + separate RMSNorm). Poison-B discriminator boot.
     import os as _os
 
-    if _os.environ.get("SGL_RDNA_NO_FUSED", "0") == "1":
+    if _os.environ.get("SGLANG_RDNA_NO_FUSED", _os.environ.get("SGL_RDNA_NO_FUSED", "0")) == "1":
         return False
     try:
         ca = get_tp_group().ca_comm

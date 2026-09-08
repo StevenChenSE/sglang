@@ -1185,7 +1185,12 @@ class GemmaRMSNorm(BaseFusedOp):
         import os as _os
 
         if _has_rocm_triton_gemma_rms_norm and (
-            _use_aiter or _os.environ.get("SGL_RDNA_GEMMA_TRITON", "0") == "1"
+            _use_aiter
+            or _os.environ.get(
+                "SGLANG_RDNA_GEMMA_TRITON",
+                _os.environ.get("SGL_RDNA_GEMMA_TRITON", "0"),
+            )
+            == "1"
         ):
             if residual is not None:
                 if post_residual_addition is not None:

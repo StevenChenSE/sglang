@@ -1036,6 +1036,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
