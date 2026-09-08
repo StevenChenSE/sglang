@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
 
 # 12.145 host-side pool guard switch (see maybe_detect_oob)
 _POOL_GUARD = bool(os.environ.get("SGL_POOL_GUARD"))
+_WITNESS_ENABLED = bool(os.environ.get("SGL_WITNESS_CHECK"))
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ def register_witness(tensor: torch.Tensor, kernel_names: dict):
 
 
 def _check_kernel_witness():
-    if not _WITNESS:
+    if not _WITNESS_ENABLED or not _WITNESS:
         return
     if torch.cuda.is_current_stream_capturing():
         return

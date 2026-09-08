@@ -260,7 +260,7 @@ class TritonAttnBackend(AttentionBackend):
         # to the in-tree verify kernels on any ineligibility.
         import os as _os
         self.rdna_verify_enabled = (
-            _os.environ.get("SGL_RDNA_VLLM_VERIFY", "0") == "1"
+            _os.environ.get("SGLANG_RDNA_VLLM_VERIFY", _os.environ.get("SGL_RDNA_VLLM_VERIFY", "0")) == "1"
         )
         self.rdna_verify_bufs = None
         self.rdna_decode_bufs = None
