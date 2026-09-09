@@ -201,51 +201,54 @@ at 16k context depth.
 ## Empirical Benchmarks
 
 All tests conducted on 2x AMD Radeon RX 7900 XTX (TP=2) with Qwen3.8-27B-W4A16.
+SGLang columns refreshed 2026-09-09 on the current merged/rebuilt build
+(`llama-benchy` 0.4.0); vLLM baseline columns are from earlier runs and should be
+re-benched under the same tool version for exact deltas.
 
 ### 1. Standardized Context Depth Profile (`llama-benchy`)
 *Standard prompt prefill ($PP=2048$) and token generation ($TG=128$), concurrency = 1*
 
 | Context Depth | SGLang MTP-3 (This Fork) | vLLM MTP-3 Baseline | vLLM DFlash2 Baseline | Advantage vs vLLM MTP-3 |
 |:---:|:---:|:---:|:---:|:---:|
-| **Depth 0** | **97.1 tok/s** | 88.6 tok/s | 71.1 tok/s | **+9.6%** |
-| **Depth 4,096** | **97.3 tok/s** | 83.3 tok/s | 68.4 tok/s | **+16.8%** |
-| **Depth 8,192** | **91.5 tok/s** | 93.3 tok/s | 71.8 tok/s | -1.9% |
-| **Depth 16,384** | **95.7 tok/s** | 75.9 tok/s | 62.2 tok/s | **+26.1%** |
-| **Retention (16k / 0k)** | **98.5%** | 85.7% | 87.5% | **Rock-solid scaling** |
+| **Depth 0** | **93.6 tok/s** | 88.6 tok/s | 71.1 tok/s | **+5.6%** |
+| **Depth 4,096** | **90.1 tok/s** | 83.3 tok/s | 68.4 tok/s | **+8.2%** |
+| **Depth 8,192** | **85.9 tok/s** | 93.3 tok/s | 71.8 tok/s | -7.9% |
+| **Depth 16,384** | **78.2 tok/s** | 75.9 tok/s | 62.2 tok/s | **+3.0%** |
+| **Retention (16k / 0k)** | **83.6%** | 85.7% | 87.5% | Two-run average |
 
 ### 2. Real-World 120k Agentic Session Replay (16 Progressive Turns)
 *Replay across 16 discrete turns of a real agentic session (332 $\to$ 120,443 tokens) with Radix APC prefix caching*
 
 | Metric | SGLang MTP-3 (This Fork) | vLLM MTP-3 | vLLM DFlash2 | Delta / Improvement |
 |---|:---:|:---:|:---:|:---:|
-| **Mean TG Speed** | **87.89 tok/s** | 63.50 tok/s | 67.96 tok/s | **+38.4% faster** |
-| **Median TG Speed** | **85.97 tok/s** | 61.52 tok/s | 67.16 tok/s | **+39.7% faster** |
-| **Jitter (CV %)** | **12.92%** | 45.34% | 36.56% | **3.5x smoother** |
-| **Worst-Case Floor** | **66.71 tok/s** | 16.94 tok/s | 32.94 tok/s | **4x higher floor** |
+| **Mean TG Speed** | **89.46 tok/s** | 63.50 tok/s | 67.96 tok/s | **+40.9% faster** |
+| **Median TG Speed** | **88.38 tok/s** | 61.52 tok/s | 67.16 tok/s | **+43.7% faster** |
+| **Jitter (CV %)** | **11.74%** | 45.34% | 36.56% | **3.9x smoother** |
+| **Worst-Case Floor** | **72.88 tok/s** | 16.94 tok/s | 32.94 tok/s | **4.3x higher floor** |
 
 ### 3. Mathematical Chain-of-Thought Reasoning (GSM8K & MATH-500)
 *Greedy sampling, temperature = 0.0, max_tokens = 1024*
 
 | Benchmark | Output Tokens | TTFT (s) | Prefill (tok/s) | Generation Speed | Accuracy |
 |---|:---:|:---:|:---:|:---:|:---:|
-| **GSM8K #1** | 48 | 0.169s | 533.5 | **98.9 tok/s** | 100% |
-| **GSM8K #2** | 196 | 0.180s | 626.9 | **116.2 tok/s** | 100% |
-| **MATH-500 #1** | 169 | 0.149s | 556.4 | **114.7 tok/s** | 100% |
-| **MATH-500 #2** | 212 | 0.137s | 533.3 | **111.2 tok/s** | 100% |
-| **Average** | — | **0.159s** | **562.5** | **110.3 tok/s** | **100%** |
+| **GSM8K #1** | 48 | 0.128s | 701.6 | **97.3 tok/s** | 100% |
+| **GSM8K #2** | 196 | 0.139s | 814.8 | **115.5 tok/s** | 100% |
+| **MATH-500 #1** | 201 | 0.137s | 605.5 | **120.8 tok/s** | 100% |
+| **MATH-500 #2** | 212 | 0.128s | 568.2 | **110.9 tok/s** | 100% |
+| **Average** | — | **0.133s** | **672.5** | **113.9 tok/s** | **100%** |
 
 ### 4. High Concurrency Throughput ($c=4$)
 *Benchmarked via `llama-benchy` across concurrent streams ($PP=2048, TG=128$, Depth 0)*
 
 | Serving Engine | Concurrency | Total PP Throughput | Total TG Throughput | Peak TG Throughput | Stability Notes |
 |---|:---:|:---:|:---:|:---:|---|
-| **SGLang MTP-3 (This Fork)** | **c = 4** | **1,974.5 tok/s** | **147.5 tok/s** | **206.0 tok/s** | **100% stable**, decode CUDA graphs + MTP-3 active |
+| **SGLang MTP-3 (This Fork)** | **c = 4** | **1,357.4 tok/s** | **78.5 tok/s** | **118.0 tok/s** | **100% stable**, decode CUDA graphs + MTP-3 active |
 | **vLLM Baseline (No Spec)** | c = 4 | 1,891.1 tok/s | 83.1 tok/s | 180.0 tok/s | Reliable baseline, but slow decode throughput |
 | **vLLM DFlash2** | c = 4 | 1,693.2 tok/s | 75.9 tok/s | 188.0 tok/s | Speculative overhead reduces aggregate TG vs baseline |
 | **vLLM MTP-3** | c = 4 | — | *(Crashed)* | — | Fails under batch > 1 (`hipErrorIllegalAddress`) |
 | **llama.cpp (MTP)** | c = 4 | 636.3 tok/s | 50.1 tok/s | — | Bottlenecked by slot queuing (`-np 2`) |
 
-> **Key Concurrency Takeaway**: While earlier vLLM setups struggled with multi-stream speculative verification on ROCm (crashing or yielding lower aggregate generation speed than baseline autoregression), SGLang's wave-aligned Triton decode graphs and isolated Mamba intermediate buffers deliver **147.5 tok/s aggregate decode throughput** under 4 concurrent streams — **+77.5% faster than vLLM baseline** and **+94.4% faster than vLLM DFlash2**.
+> **Key Concurrency Takeaway**: SGLang's MTP-3 stays **100% stable under 4 concurrent speculative streams** on RDNA3 — no `hipErrorIllegalAddress`, no graph-capture failures, no TG decay across streams (vLLM's native MTP-3 still crashes at batch > 1). Under the current `llama-benchy` 0.4.0 concurrency model, aggregate decode lands at **78.5 tok/s** with a **118 tok/s peak**; the vLLM columns predate this tool version, so re-bench the baselines under 0.4.0 before quoting exact cross-engine deltas at c = 4.
 
 ---
 
