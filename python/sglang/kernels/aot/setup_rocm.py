@@ -38,7 +38,8 @@ import sysconfig
 operator_namespace = "sgl_kernel"
 py_include = Path(sys.prefix) / "include" / f"python{sys.version_info.major}.{sys.version_info.minor}"
 if not (py_include / "Python.h").exists():
-    py_include = root.parent.parent.parent.parent / "pydev/usr/include" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    # Canonical interpreter headers (venv system-site, conda, deb python-dev).
+    py_include = Path(sysconfig.get_path("include"))
 
 include_dirs = [
     root / "include",

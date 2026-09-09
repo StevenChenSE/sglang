@@ -12,6 +12,7 @@
 # hipified CU_POINTER_ATTRIBUTE_* constant. We copy the sources into the build
 # dir and rewrite them there, so the AOT tree itself is never modified.
 
+import hashlib
 import os
 import shutil
 import sys
@@ -24,8 +25,6 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "../.."))
 _AOT_AR_DIR = os.path.join(_REPO_ROOT, "python/sglang/kernels/aot/csrc/allreduce")
 _AOT_INCLUDE = os.path.join(_REPO_ROOT, "python/sglang/kernels/aot/include")
-
-_BUILD_KEY = "sgl_rdna_ar_v18"
 
 _RELEASE_ST = r'''static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 #ifdef USE_MUSA
@@ -139,6 +138,28 @@ DINLINE P* get_tmp_buf(Signal* sg) {"""
 
     assert "asm volatile" not in out or '"l"' not in out, "PTX asm with 'l' constraint still present"
     return out
+
+
+def _source_hash() -> str:
+    """Hash every input that determines the built binary: this loader (the
+    patches live here), the wrapper .cu, and the patched AOT header. Folded
+    into the build key so a vendored .so can never outlive its sources —
+    without it, an edited custom_all_reduce_hip.cuh would silently keep
+    loading the previous binary from the vendor cache."""
+    h = hashlib.sha256()
+    with open(os.path.abspath(__file__), "rb") as f:
+        h.update(f.read())
+    with open(os.path.join(_THIS_DIR, "rdna_custom_all_reduce.cu"), "rb") as f:
+        h.update(f.read())
+    with open(os.path.join(_AOT_AR_DIR, "custom_all_reduce_hip.cuh")) as f:
+        h.update(_patch_header(f.read()).encode())
+    return h.hexdigest()[:8]
+
+
+# v18 was the last manually-versioned key; the hash suffix takes over
+# invalidation from here. Bump the base only when the ABI contract itself
+# (exported symbols) changes incompatibly.
+_BUILD_KEY = f"sgl_rdna_ar_v18_{_source_hash()}"
 
 
 def _load():
