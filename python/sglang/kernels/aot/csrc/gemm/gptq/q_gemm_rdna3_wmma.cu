@@ -2051,16 +2051,21 @@ void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
     return;
   }
 
-  // V8 (128M × 64N, K=32/iter, 8-wave dequant) when K%32==0 and gs≥32.
-  // Falls back to V7 otherwise. V7/V8 read A sequentially, so act-order
-  // (b_q_perm != null) must skip them and use v5, which honors the perm.
+  // V8 (128M × 64N, K=32/iter, 8-wave dequant) when K%32==0 and the group
+  // size sits on the 32-element grid — groupsize >= 32 alone is not enough:
+  // a boundary at a non-multiple of 32 (e.g. gs=112) would be straddled by
+  // a K step and half the tile would dequantize with the previous group's
+  // scale. Falls back to V7 (K=16/iter) otherwise. V7/V8 read A sequentially,
+  // so act-order (b_q_perm != null) must skip them and use v5, which honors
+  // the perm.
   if (size_m >= 128 && b_q_perm == nullptr) {
     const int k_split =
         compute_wmma_k_split_mn(size_m, size_n, size_k, 128, 64);
     const int groupsize = size_k / groups;
     dim3 block(256);
     dim3 grid((size_n + 63) / 64, (size_m + 127) / 128, k_split);
-    if (size_k % 32 == 0 && groupsize >= 32 && (size_k / k_split) % 32 == 0) {
+    if (size_k % 32 == 0 && groupsize >= 32 && groupsize % 32 == 0 &&
+        (size_k / k_split) % 32 == 0) {
       gemm_q4_wmma_kernel_128x64_k32<T><<<grid, block, 0, stream>>>(
           a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
           zero_offset, b_q_perm);
@@ -2144,6 +2149,13 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
   TORCH_CHECK(b_scales.size(1) == size_n, "b_scales last dim must be N");
   TORCH_CHECK(size_n % 16 == 0, "WMMA path requires N % 16 == 0");
   TORCH_CHECK(size_k % 16 == 0, "WMMA path requires K % 16 == 0");
+  // Every variant steps K in 16- or 32-element tiles and detects group
+  // transitions on tile boundaries (the 128x64_k32 variant additionally
+  // gates itself on a 32-element grid); a group size off the 16-element
+  // grid would mis-attribute the tail of a straddling tile to the previous
+  // group.
+  TORCH_CHECK(groups >= 1 && (groups == 1 || (size_k / groups) % 16 == 0),
+              "WMMA path requires group_size to be a multiple of 16");
 
   auto opts = torch::TensorOptions().dtype(a.dtype()).device(a.device());
   // Always zero-init the output: some V3-V8 boundary threads may exit

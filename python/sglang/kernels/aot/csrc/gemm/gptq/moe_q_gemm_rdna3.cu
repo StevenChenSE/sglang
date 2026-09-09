@@ -175,6 +175,12 @@ __global__ void moe_gemm_q4_kernel_rdna3(
   if (token_block * BLOCK_SIZE_M >= num_tokens_post_padded[0]) return;
 
   const int expert_id = expert_ids[token_block];
+  // NOTE when wiring this kernel to sglang's moe_align_block_size: that
+  // launcher uses num_experts + 1 buckets, so tokens routed to an invalid
+  // expert land in bucket `num_experts` (not -1). This kernel receives no
+  // expert count, so such a block would read weights past b_q_weight. If
+  // invalid experts are not ignored upstream, thread num_experts in and
+  // bail on expert_id >= num_experts here before dereferencing.
   if (expert_id == -1) return;
 
   // Expert-specific pointers

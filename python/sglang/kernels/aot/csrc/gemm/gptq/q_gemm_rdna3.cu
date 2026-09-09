@@ -715,6 +715,13 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format) {
+#ifndef SGL_IS_RDNA
+  // The rdna3 device kernels compile to empty stubs on non-RDNA targets, so
+  // a call here would silently return uninitialized memory. Registered on
+  // all ROCm targets for symbol parity; hard-fail off-gfx1100 like the WMMA
+  // and MoE sibling ops do.
+  TORCH_CHECK(false, "gptq_gemm_rdna3 is only supported on RDNA architectures");
+#endif
   // Validate inputs and pin the device context BEFORE the WMMA dispatch
   // below: on a multi-GPU system the caller's current device may differ
   // from a's, and every downstream access (stream query, data_ptr,
@@ -758,6 +765,14 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
               "b_scales must have same group count as qzeros");
   TORCH_CHECK(b_scales.size(1) == size_n, "b_scales last dim must be N");
   TORCH_CHECK(size_n % 8 == 0, "N must be a multiple of 8 (64-bit atomic CAS)");
+  // The K loop advances 32 rows per outer iteration and prefetches all 4
+  // weight words unguarded, and group transitions are only detected on
+  // 32-row boundaries — a K or group size off that grid would read past the
+  // weight tensor and silently corrupt the output. The MoE entry enforces
+  // the same two invariants.
+  TORCH_CHECK(size_k % 32 == 0, "K must be a multiple of 32");
+  TORCH_CHECK(groups >= 1 && (groups == 1 || (size_k / groups) % 32 == 0),
+              "group_size must be a multiple of 32");
 
   auto opts = torch::TensorOptions().dtype(a.dtype()).device(a.device());
   at::Tensor c = torch::zeros({size_m, size_n}, opts);
