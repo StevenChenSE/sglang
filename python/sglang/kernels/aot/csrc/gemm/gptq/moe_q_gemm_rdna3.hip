@@ -176,6 +176,12 @@ __global__ void moe_gemm_q4_kernel_rdna3(
   if (token_block * BLOCK_SIZE_M >= num_tokens_post_padded[0]) return;
 
   const int expert_id = expert_ids[token_block];
+  // NOTE when wiring this kernel to sglang's moe_align_block_size: that
+  // launcher uses num_experts + 1 buckets, so tokens routed to an invalid
+  // expert land in bucket `num_experts` (not -1). This kernel receives no
+  // expert count, so such a block would read weights past b_q_weight. If
+  // invalid experts are not ignored upstream, thread num_experts in and
+  // bail on expert_id >= num_experts here before dereferencing.
   if (expert_id == -1) return;
 
   // Expert-specific pointers
@@ -227,8 +233,10 @@ __global__ void moe_gemm_q4_kernel_rdna3(
   int qk = offset_k / 8;
   const uint32_t* b_ptr = expert_weights + qk * size_n + n;
 
-  // Per-column dequant constants (4 columns per thread)
-  half2 z_h[4], y_h[4];
+  // Per-column dequant constants (4 columns per thread). prep_zero_scale_fp16
+  // and dequant_4bit_8_fp16 take half2 pair-references (z1z16/y1y16), matching
+  // the dense kernel's z1z16_h[4][2] layout.
+  half2 z_h[4][2], y_h[4][2];
   float z_b_f[4], y_b_f[4];
 
   // GPTQv1: zero_offset = 1
