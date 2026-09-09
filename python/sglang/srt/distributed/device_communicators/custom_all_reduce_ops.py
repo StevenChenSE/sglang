@@ -55,6 +55,11 @@ if _RDNA_CUSTOM_AR:
         import rdna_ar_ext as _custom_ar  # type: ignore[no-redef]
 
         IS_CUSTOM_AR_AVAILABLE = True
+        # rdna_ar_ext only exports the custom-AR surface; the quick-AR
+        # (qr_*) wrappers below would bind to missing symbols and raise
+        # AttributeError if ever invoked. gfx1100 is outside
+        # qr_rocm_arch_available() anyway, so keep the flag honest.
+        IS_QUICK_AR_AVAILABLE = False
         logger.warning(
             "SGLANG_RDNA_CUSTOM_AR=1: using standalone RDNA custom allreduce "
             "extension (rdna_ar_ext); sgl_kernel AR ops are overridden"
