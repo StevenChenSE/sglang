@@ -41,9 +41,11 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.utils import is_cuda, is_hip
 
-_is_cuda = is_cuda() or is_hip()
+# The marlin repack op is available on both CUDA and HIP builds; do NOT add
+# unrelated CUDA-only gating to this flag.
+_has_marlin_repack = is_cuda() or is_hip()
 
-if _is_cuda:
+if _has_marlin_repack:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 
