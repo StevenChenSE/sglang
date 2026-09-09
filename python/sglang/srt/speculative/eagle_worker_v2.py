@@ -131,11 +131,12 @@ _is_xpu = is_xpu()
 def _vocab_parallel_top1(logits: torch.Tensor):
     """Global top-1 over TP-sharded local logits without an all-gather.
 
-    Exchanges only (max_val, global_idx) pairs (8 B/token). Preserves the
-    first-index tie-break across ranks (ties resolve to the lower rank, and
-    within a rank to torch.argmax's local choice). Returns (topk_p, topk_index)
-    matching the eager topk==1 contract: topk_p is ones (unused without
-    rejection sampling).
+    Exchanges only (max_val, global_idx) pairs (8 B/token) and reduces over
+    every rank. Ties resolve to the smaller global index, i.e. the lower rank
+    (and within a rank to torch.argmax's local choice); NaN local maxima lose
+    to any finite candidate, and if every rank is NaN rank 0's pick wins.
+    Returns (topk_p, topk_index) matching the eager topk==1 contract: topk_p
+    is ones (unused without rejection sampling).
     """
     from sglang.srt.distributed import (
         get_tensor_model_parallel_world_size,
@@ -153,9 +154,15 @@ def _vocab_parallel_top1(logits: torch.Tensor):
         [local_val, (local_idx + tp.rank * local_size).to(torch.float32)], dim=-1
     )
     gathered = tp.all_gather(packed, dim=0).view(tp_size, *local_idx.shape, 2)
-    v0, i0 = gathered[0, :, :, 0], gathered[0, :, :, 1]
-    v1, i1 = gathered[1, :, :, 0], gathered[1, :, :, 1]
-    idx = torch.where(v1 > v0, i1, i0).to(torch.long)
+    # [tp_size, batch, 1] per element. nan_to_num keeps NaN shards from
+    # poisoning the max; a -inf across all ranks still resolves to rank 0.
+    vals = torch.nan_to_num(gathered[..., 0], nan=float("-inf"))
+    idxs = gathered[..., 1]
+    max_val = vals.amax(dim=0)
+    # Among ties take the smallest global index: global indices grow with
+    # rank, so this is exactly the lowest-rank tie-break.
+    idx = torch.where(vals == max_val, idxs, idxs.new_full((), float("inf")))
+    idx = idx.amin(dim=0).to(torch.long)
     return torch.ones_like(idx, dtype=torch.float32), idx
 
 
