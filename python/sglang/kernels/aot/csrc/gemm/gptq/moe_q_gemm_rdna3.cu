@@ -232,8 +232,10 @@ __global__ void moe_gemm_q4_kernel_rdna3(
   int qk = offset_k / 8;
   const uint32_t* b_ptr = expert_weights + qk * size_n + n;
 
-  // Per-column dequant constants (4 columns per thread)
-  half2 z_h[4], y_h[4];
+  // Per-column dequant constants (4 columns per thread). prep_zero_scale_fp16
+  // and dequant_4bit_8_fp16 take half2 pair-references (z1z16/y1y16), matching
+  // the dense kernel's z1z16_h[4][2] layout.
+  half2 z_h[4][2], y_h[4][2];
   float z_b_f[4], y_b_f[4];
 
   // GPTQv1: zero_offset = 1
