@@ -1927,6 +1927,12 @@ torch::Tensor gptq_gemm(
   TORCH_CHECK(bit == 4, "Only 4-bit GPTQ is supported on RDNA3");
   return gptq_gemm_rdna3(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, false);
 #else
+  // The exllama path computes through __half/hipblas-Hgemm only; a bf16
+  // input would be bit-reinterpreted as fp16, so reject it up front. bf16
+  // activations are served by the RDNA3 kernels above.
+  TORCH_CHECK(
+      a.scalar_type() == at::ScalarType::Half,
+      "gptq_gemm supports fp16 activations on this platform; bf16 requires the RDNA3 (gfx1100) kernels");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
   at::Tensor c = torch::empty({a.size(0), b_q_weight.size(1)}, options);

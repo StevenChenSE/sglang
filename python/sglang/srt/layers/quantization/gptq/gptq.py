@@ -132,7 +132,12 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half, torch.bfloat16]
+        # bf16 activations require the RDNA3 GEMM kernels. The exllama GPTQ
+        # kernel serving CUDA/CDNA computes in fp16 only and has no dtype
+        # check, so a bf16 tensor would be silently bit-reinterpreted as fp16.
+        from sglang.srt.utils.common import is_rdna_supported
+
+        return [torch.half, torch.bfloat16] if is_rdna_supported() else [torch.half]
 
     @classmethod
     # Need to figure it out
