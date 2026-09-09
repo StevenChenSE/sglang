@@ -137,6 +137,65 @@ python -m sglang.launch_server \
   --sleep-on-idle
 ```
 
+### DFlash2 Speculative Decoding (Production)
+
+The production systemd service (`sglang.service`) launches the DFlash2 recipe
+via `scripts/rdna-serve.sh qwen38-autoround-dflash2`. Equivalent manual launch:
+
+```bash
+export SGLANG_KV_CACHE_DTYPE=bfloat16
+export SGLANG_DTYPE=bfloat16
+export SGLANG_PHASE_TIMING=0
+export SGLANG_RDNA_CUSTOM_AR=1
+export SGLANG_RDNA_NO_FUSED=1
+export SGLANG_RDNA_GEMMA_TRITON=1
+export SGLANG_RDNA_VLLM_VERIFY=1
+export SGLANG_RDNA_AR_PATH=/path/to/rdna_ar
+
+python -m sglang.launch_server \
+  --model-path /path/to/qwen3.8-27b-mtp-fixed \
+  --served-model-name qwen3.8-27b \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --tp-size 2 \
+  --quantization gptq \
+  --dtype bfloat16 \
+  --mamba-ssm-dtype bfloat16 \
+  --kv-cache-dtype bfloat16 \
+  --attention-backend triton \
+  --context-length 196608 \
+  --mem-fraction-static 0.90 \
+  --max-running-requests 4 \
+  --max-mamba-cache-size 20 \
+  --cuda-graph-bs-decode 1 2 4 \
+  --triton-attention-num-kv-splits 16 \
+  --chunked-prefill-size 2048 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --speculative-algorithm dflash \
+  --speculative-draft-model-path /path/to/Qwen3.8-27B-DFlash2 \
+  --speculative-draft-model-quantization unquant \
+  --speculative-num-draft-tokens 8 \
+  --speculative-draft-window-size 2048 \
+  --stream-interval 1
+```
+
+Key DFlash2 differences vs the MTP-3 recipe above:
+
+- Draft model is the separate **Qwen3.8-27B-DFlash2** checkpoint (5-layer
+  drafter, `incoai/Qwen3.8-27B-DFlash2` on HF Hub), loaded unquantized via
+  `--speculative-draft-model-quantization unquant` so it does not inherit the
+  target model's W4A16 quantization config.
+- `--speculative-num-draft-tokens 8` (7-token draft block + 1) with a
+  `--speculative-draft-window-size 2048` sliding draft window.
+- `--kv-cache-dtype bfloat16` and `--mem-fraction-static 0.90` reserve the
+  dedicated draft KV budget (DFlash2 runs ~14.5 GiB total vs ~11.3 GiB for MTP-3).
+- Adds `--chunked-prefill-size 2048` and the qwen3 reasoning / tool-call parsers.
+
+Measured on this fork (2026-09-09, 2x RX 7900 XTX TP=2): math CoT TG ~166 tok/s
+(GSM8K/MATH-500), 120k agentic replay mean TG ~83 tok/s, and >100% TG retention
+at 16k context depth.
+
 ---
 
 ## Empirical Benchmarks

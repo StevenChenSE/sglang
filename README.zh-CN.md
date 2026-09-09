@@ -134,6 +134,64 @@ python -m sglang.launch_server \
   --sleep-on-idle
 ```
 
+### DFlash2 推测解码（生产配置）
+
+生产环境 systemd 服务（`sglang.service`）通过 `scripts/rdna-serve.sh qwen38-autoround-dflash2`
+启动 DFlash2 配方。等效的手动启动命令如下：
+
+```bash
+export SGLANG_KV_CACHE_DTYPE=bfloat16
+export SGLANG_DTYPE=bfloat16
+export SGLANG_PHASE_TIMING=0
+export SGLANG_RDNA_CUSTOM_AR=1
+export SGLANG_RDNA_NO_FUSED=1
+export SGLANG_RDNA_GEMMA_TRITON=1
+export SGLANG_RDNA_VLLM_VERIFY=1
+export SGLANG_RDNA_AR_PATH=/path/to/rdna_ar
+
+python -m sglang.launch_server \
+  --model-path /path/to/qwen3.8-27b-mtp-fixed \
+  --served-model-name qwen3.8-27b \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --tp-size 2 \
+  --quantization gptq \
+  --dtype bfloat16 \
+  --mamba-ssm-dtype bfloat16 \
+  --kv-cache-dtype bfloat16 \
+  --attention-backend triton \
+  --context-length 196608 \
+  --mem-fraction-static 0.90 \
+  --max-running-requests 4 \
+  --max-mamba-cache-size 20 \
+  --cuda-graph-bs-decode 1 2 4 \
+  --triton-attention-num-kv-splits 16 \
+  --chunked-prefill-size 2048 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --speculative-algorithm dflash \
+  --speculative-draft-model-path /path/to/Qwen3.8-27B-DFlash2 \
+  --speculative-draft-model-quantization unquant \
+  --speculative-num-draft-tokens 8 \
+  --speculative-draft-window-size 2048 \
+  --stream-interval 1
+```
+
+DFlash2 相比上方 MTP-3 配方的关键差异：
+
+- 草稿模型为独立的 **Qwen3.8-27B-DFlash2** 权重（5 层草稿网络，HF Hub 上的
+  `incoai/Qwen3.8-27B-DFlash2`），通过 `--speculative-draft-model-quantization unquant`
+  以非量化方式加载，不继承目标模型的 W4A16 量化配置。
+- `--speculative-num-draft-tokens 8`（7 token 草稿块 + 1），配合
+  `--speculative-draft-window-size 2048` 滑动草稿窗口。
+- `--kv-cache-dtype bfloat16` 与 `--mem-fraction-static 0.90` 为草稿模型预留独立
+  KV 预算（DFlash2 总显存约 14.5 GiB，MTP-3 约 11.3 GiB）。
+- 额外启用 `--chunked-prefill-size 2048` 以及 qwen3 推理 / 工具调用解析器。
+
+本 Fork 实测（2026-09-09，双卡 RX 7900 XTX TP=2）：数学 CoT 生成速度约 166 tok/s
+（GSM8K/MATH-500），120k Agentic 会话回放平均生成速度约 83 tok/s，16k 上下文深度
+TG 保持率超过 100%。
+
 ---
 
 ## 实测性能基准对比
