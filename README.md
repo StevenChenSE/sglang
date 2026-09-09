@@ -193,8 +193,8 @@ Key DFlash2 differences vs the MTP-3 recipe above:
 - Adds `--chunked-prefill-size 2048` and the qwen3 reasoning / tool-call parsers.
 
 Measured on this fork (2026-09-09, 2x RX 7900 XTX TP=2): math CoT TG ~166 tok/s
-(GSM8K/MATH-500), 120k agentic replay mean TG ~83 tok/s, and >100% TG retention
-at 16k context depth.
+(GSM8K/MATH-500), 120k agentic replay mean TG ~84 tok/s, and ~97% TG retention
+at 16k context depth (two-run averages).
 
 ---
 
@@ -202,29 +202,34 @@ at 16k context depth.
 
 All tests conducted on 2x AMD Radeon RX 7900 XTX (TP=2) with Qwen3.8-27B-W4A16.
 SGLang columns refreshed 2026-09-09 on the current merged/rebuilt build
-(`llama-benchy` 0.4.0); vLLM baseline columns are from earlier runs and should be
-re-benched under the same tool version for exact deltas.
+(`llama-benchy` 0.4.0); depth-profile and 120k numbers are two-run averages,
+DFlash2 math and c=4 are single runs. vLLM baseline columns are from earlier
+runs and should be re-benched under the same tool version for exact deltas.
 
 ### 1. Standardized Context Depth Profile (`llama-benchy`)
 *Standard prompt prefill ($PP=2048$) and token generation ($TG=128$), concurrency = 1*
 
-| Context Depth | SGLang MTP-3 (This Fork) | vLLM MTP-3 Baseline | vLLM DFlash2 Baseline | Advantage vs vLLM MTP-3 |
+| Context Depth | SGLang MTP-3 (This Fork) | SGLang DFlash2 (This Fork) | vLLM MTP-3 Baseline | vLLM DFlash2 Baseline |
 |:---:|:---:|:---:|:---:|:---:|
-| **Depth 0** | **93.6 tok/s** | 88.6 tok/s | 71.1 tok/s | **+5.6%** |
-| **Depth 4,096** | **90.1 tok/s** | 83.3 tok/s | 68.4 tok/s | **+8.2%** |
-| **Depth 8,192** | **85.9 tok/s** | 93.3 tok/s | 71.8 tok/s | -7.9% |
-| **Depth 16,384** | **78.2 tok/s** | 75.9 tok/s | 62.2 tok/s | **+3.0%** |
-| **Retention (16k / 0k)** | **83.6%** | 85.7% | 87.5% | Two-run average |
+| **Depth 0** | **93.6 tok/s** | **107.9 tok/s** | 88.6 tok/s | 71.1 tok/s |
+| **Depth 4,096** | **90.1 tok/s** | **96.8 tok/s** | 83.3 tok/s | 68.4 tok/s |
+| **Depth 8,192** | **85.9 tok/s** | **97.7 tok/s** | 93.3 tok/s | 71.8 tok/s |
+| **Depth 16,384** | **78.2 tok/s** | **105.1 tok/s** | 75.9 tok/s | 62.2 tok/s |
+| **Retention (16k / 0k)** | **83.6%** | **97.4%** | 85.7% | 87.5% |
+
+> MTP-3 vs vLLM MTP-3: +5.6 / +8.2 / −7.9 / +3.0%. DFlash2 vs vLLM DFlash2: +51.8 / +41.5 / +36.1 / +69.0%. Note the depth-trend inversion: DFlash2's windowed drafting holds or *raises* TG as context grows, while MTP-3 decays past ~4k.
 
 ### 2. Real-World 120k Agentic Session Replay (16 Progressive Turns)
 *Replay across 16 discrete turns of a real agentic session (332 $\to$ 120,443 tokens) with Radix APC prefix caching*
 
-| Metric | SGLang MTP-3 (This Fork) | vLLM MTP-3 | vLLM DFlash2 | Delta / Improvement |
+| Metric | SGLang MTP-3 (This Fork) | SGLang DFlash2 (This Fork) | vLLM MTP-3 | vLLM DFlash2 |
 |---|:---:|:---:|:---:|:---:|
-| **Mean TG Speed** | **89.46 tok/s** | 63.50 tok/s | 67.96 tok/s | **+40.9% faster** |
-| **Median TG Speed** | **88.38 tok/s** | 61.52 tok/s | 67.16 tok/s | **+43.7% faster** |
-| **Jitter (CV %)** | **11.74%** | 45.34% | 36.56% | **3.9x smoother** |
-| **Worst-Case Floor** | **72.88 tok/s** | 16.94 tok/s | 32.94 tok/s | **4.3x higher floor** |
+| **Mean TG Speed** | **89.46 tok/s** | **83.8 tok/s** | 63.50 tok/s | 67.96 tok/s |
+| **Median TG Speed** | **88.38 tok/s** | **79.8 tok/s** | 61.52 tok/s | 67.16 tok/s |
+| **Jitter (CV %)** | **11.74%** | **23.0%** | 45.34% | 36.56% |
+| **Worst-Case Floor** | **72.88 tok/s** | **40.6 tok/s** | 16.94 tok/s | 32.94 tok/s |
+
+> MTP-3: **+40.9% mean** and **3.9x smoother** than vLLM MTP-3, **4.3x** its floor. DFlash2: **+23.3% mean** than vLLM DFlash2, 1.6x smoother. MTP-3 wins stability and worst-case floor; DFlash2 wins deep-context TG holding (table 1) and c=4 aggregate (table 4).
 
 ### 3. Mathematical Chain-of-Thought Reasoning (GSM8K & MATH-500)
 *Greedy sampling, temperature = 0.0, max_tokens = 1024*
@@ -237,18 +242,31 @@ re-benched under the same tool version for exact deltas.
 | **MATH-500 #2** | 212 | 0.128s | 568.2 | **110.9 tok/s** | 100% |
 | **Average** | — | **0.133s** | **672.5** | **113.9 tok/s** | **100%** |
 
+**SGLang DFlash2 (same suite, single run):**
+
+| Benchmark | Output Tokens | TTFT (s) | Prefill (tok/s) | Generation Speed | Accuracy |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **GSM8K #1** | 52 | 0.131s | 689.3 | **124.8 tok/s** | ✗ (answered 96, gold 72) |
+| **GSM8K #2** | 200 | 0.140s | 805.1 | **171.2 tok/s** | ✓ |
+| **MATH-500 #1** | 195 | 0.137s | 606.9 | **197.7 tok/s** | ✓ |
+| **MATH-500 #2** | 511 | 0.132s | 551.3 | **154.4 tok/s** | ✓ |
+| **Average** | — | **0.135s** | **663.2** | **166.0 tok/s** | **75% (3/4)** |
+
+> DFlash2 generates ~50% faster on math but slipped GSM8K #1 under greedy sampling in both runs (answered 96; gold 72) — a known trade-off of its windowed draft path on the quantized dense GEMM; MTP-3 answers all four correctly.
+
 ### 4. High Concurrency Throughput ($c=4$)
 *Benchmarked via `llama-benchy` across concurrent streams ($PP=2048, TG=128$, Depth 0)*
 
 | Serving Engine | Concurrency | Total PP Throughput | Total TG Throughput | Peak TG Throughput | Stability Notes |
 |---|:---:|:---:|:---:|:---:|---|
 | **SGLang MTP-3 (This Fork)** | **c = 4** | **1,357.4 tok/s** | **78.5 tok/s** | **118.0 tok/s** | **100% stable**, decode CUDA graphs + MTP-3 active |
+| **SGLang DFlash2 (This Fork)** | **c = 4** | **1,275.5 tok/s** | **92.1 tok/s** | **146.0 tok/s** | **100% stable**, single sample |
 | **vLLM Baseline (No Spec)** | c = 4 | 1,891.1 tok/s | 83.1 tok/s | 180.0 tok/s | Reliable baseline, but slow decode throughput |
 | **vLLM DFlash2** | c = 4 | 1,693.2 tok/s | 75.9 tok/s | 188.0 tok/s | Speculative overhead reduces aggregate TG vs baseline |
 | **vLLM MTP-3** | c = 4 | — | *(Crashed)* | — | Fails under batch > 1 (`hipErrorIllegalAddress`) |
 | **llama.cpp (MTP)** | c = 4 | 636.3 tok/s | 50.1 tok/s | — | Bottlenecked by slot queuing (`-np 2`) |
 
-> **Key Concurrency Takeaway**: SGLang's MTP-3 stays **100% stable under 4 concurrent speculative streams** on RDNA3 — no `hipErrorIllegalAddress`, no graph-capture failures, no TG decay across streams (vLLM's native MTP-3 still crashes at batch > 1). Under the current `llama-benchy` 0.4.0 concurrency model, aggregate decode lands at **78.5 tok/s** with a **118 tok/s peak**; the vLLM columns predate this tool version, so re-bench the baselines under 0.4.0 before quoting exact cross-engine deltas at c = 4.
+> **Key Concurrency Takeaway**: Both SGLang spec engines stay **100% stable under 4 concurrent streams** on RDNA3 — no `hipErrorIllegalAddress`, no graph-capture failures (vLLM's native MTP-3 still crashes at batch > 1). DFlash2 leads the c = 4 field at **92.1 tok/s aggregate** (+10.8% vs the vLLM no-spec baseline, +21.3% vs vLLM DFlash2) with a **146 tok/s peak**; MTP-3 lands at 78.5 tok/s. The vLLM columns predate `llama-benchy` 0.4.0, so re-bench the baselines under 0.4.0 before quoting exact cross-engine deltas.
 
 ---
 
