@@ -1657,6 +1657,9 @@ class ModelConfig:
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
+            # gfx1100 fork: plain GPTQ rides the RDNA3 W4A16 kernels
+            # (sgl_kernel gptq_gemm / gptq_shuffle from our AOT wheel).
+            "gptq",
             "fp8",
             "compressed_tensors",
             "compressed-tensors",

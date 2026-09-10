@@ -29,10 +29,13 @@ class GPTQLinearScheme(GPTQLinearSchemeBase):
         self.kernel = self._init_kernel(quant_config)
 
     def _init_kernel(self, quant_config: GPTQConfig):
-        raise RuntimeError(
-            "The non-Marlin GPTQ CUDA kernel has been removed. Use "
-            "quantization='gptq_marlin' (or a Marlin-compatible checkpoint) instead."
+        # gfx1100 fork: upstream raises here since #32114 deleted the CUDA
+        # exllama kernel; on ROCm/RDNA3 the RDNA3 GPTQ kernel lives on.
+        from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+            GPTQLinearKernel,
         )
+
+        return GPTQLinearKernel(quant_config)
 
     def create_weights(
         self,

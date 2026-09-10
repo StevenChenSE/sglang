@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
     GPTQAscendConfig,
+    GPTQConfig,
     GPTQMarlinConfig,
     GPTQXPUConfig,
 )
@@ -74,6 +75,11 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
+    # gfx1100 fork: keep plain "gptq" registered. Upstream removed it together
+    # with the CUDA exllama kernel (#32114); here it dispatches to the RDNA3
+    # GPTQLinearKernel in hardware_backend/gpu/quantization/gptq_kernels.py.
+    # Platform-specific registrations below still override this key.
+    "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
