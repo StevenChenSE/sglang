@@ -3,12 +3,6 @@ from typing import Optional
 import torch
 
 
-def awq_dequantize(
-    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
-) -> torch.ByteTensor:
-    return torch.ops.sgl_kernel.awq_dequantize.default(qweight, scales, qzeros)
-
-
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return torch.ops.sgl_kernel.int8_scaled_mm.default(
         mat_a,

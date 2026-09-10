@@ -49,6 +49,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
+    is_glm_moe_dsa,
 )
 from sglang.srt.distributed import (
     divide,
@@ -199,6 +200,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_non_idle_and_non_empty,
+    is_sm90_supported,
     make_layers,
     use_intel_amx_backend,
 )
@@ -473,7 +475,9 @@ class MoEGate(nn.Module):
         )
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
-            if quant_config is not None:
+            # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
+            # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
+            if quant_config is not None and not is_glm_moe_dsa(config):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
@@ -713,6 +717,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_flashinfer_megamoe()
                 or get_moe_a2a_backend().is_deepep_v2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
@@ -781,7 +786,7 @@ class DeepseekV2MoE(nn.Module):
                 not is_packed_weight
                 and shared_gate_up_weight.dtype == torch.float8_e4m3fn
             )
-            if self.shared_experts_is_fp8:
+            if self.shared_experts_is_fp8 and not _is_npu:
                 if (
                     _use_aiter
                     and config.quantization_config.get("quant_method")
@@ -2585,7 +2590,7 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
 
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank or (_is_npu and self.pp_group.is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -2970,6 +2975,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         if get_exec().moe.enforce_shared_experts_fusion:
             return None
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and is_sm90_supported()
+            and get_moe_runner_backend().is_marlin()
+        ):
+            return (
+                "Hopper modelopt_fp4 with moe_runner_backend=marlin: "
+                "fusion off by default until the shared-expert fused load path "
+                "is validated."
+            )
         if is_sbo_enabled() or is_tbo_enabled():
             return "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
         if is_deepep_class_backend():
