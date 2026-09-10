@@ -86,6 +86,7 @@ from sglang.srt.utils import (
     is_gfx942_supported,
     is_xpu,
     next_power_of_2,
+    is_rdna_supported,
 )
 
 _is_cuda = is_cuda()
@@ -262,8 +263,11 @@ class TritonAttnBackend(AttentionBackend):
         self.rdna_verify_enabled = (
             _os.environ.get("SGLANG_RDNA_VLLM_VERIFY", _os.environ.get("SGL_RDNA_VLLM_VERIFY", "0")) == "1"
         )
-        self.rdna_verify_bufs = None
-        self.rdna_decode_bufs = None
+        # N7 (round-3 review): keyed on the layer shape tuple instead of a
+        # single first-layer allocation, so a later eligible layer with a
+        # different h_q / head_dim / v_head_dim gets its own buffers.
+        self.rdna_verify_bufs: dict = {}
+        self.rdna_decode_bufs: dict = {}
         self._rdna_verify_warned = False
         self._rdna_verify_failed = False
 
@@ -363,9 +367,13 @@ class TritonAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
+        _kv_splits_env = envs.SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS.get()
+        if _kv_splits_env is not None and not is_rdna_supported():
+            # M18: gfx1100-tuned override must not silently re-tune CDNA.
+            _kv_splits_env = None
         self.max_kv_splits = (
-            envs.SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS.get()
-            if envs.SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS.get() is not None
+            _kv_splits_env
+            if _kv_splits_env is not None
             else get_exec().kernel.triton_attention_num_kv_splits
         )
         if self.use_mla and not _is_xpu:
@@ -1989,20 +1997,24 @@ class TritonAttnBackend(AttentionBackend):
             if bs > 64 or extend_meta.rdna_extend_ocl is None:
                 raise ValueError("draft-extend batch exceeds adapter sizing")
 
-        if self.rdna_verify_bufs is None:
-            self.rdna_verify_bufs = RdnaVerifyBuffers(
+        block_q = 16 // (q.shape[1] // self.token_to_kv_pool.get_key_buffer(
+            layer.layer_id
+        ).shape[1])
+        verify_key = (q.shape[1], q.shape[2], layer.v_head_dim,
+                      num_draft_tokens, block_q)
+        if verify_key not in self.rdna_verify_bufs:
+            self.rdna_verify_bufs[verify_key] = RdnaVerifyBuffers(
                 device=q.device,
                 max_bs=64,
                 max_pages=self.max_context_len + 32,
                 num_draft_tokens=num_draft_tokens,
                 h_q=q.shape[1],
                 head_dim=q.shape[2],
-                block_q=16 // (q.shape[1] // self.token_to_kv_pool.get_key_buffer(
-                    layer.layer_id
-                ).shape[1]),
+                block_q=block_q,
                 segments=32,  # offline sweep 12.139: 292->190us @16k
                 head_dim_v=layer.v_head_dim,
             )
+        rdna_verify_bufs = self.rdna_verify_bufs[verify_key]
 
         if extend_meta is not None:
             from sglang.kernels.ops.attention.rdna_verify_adapter import (
@@ -2010,7 +2022,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
             rdna_fill_extend(
-                self.rdna_verify_bufs,
+                rdna_verify_bufs,
                 kv_indices,
                 meta.kv_indptr,
                 extend_meta.rdna_extend_ocl,
@@ -2029,7 +2041,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices,
             forward_batch.seq_lens,
             layer.scaling,
-            self.rdna_verify_bufs,
+            rdna_verify_bufs,
             bs,
             num_draft_tokens,
             softcap=logits_soft_cap,
@@ -2057,19 +2069,22 @@ class TritonAttnBackend(AttentionBackend):
         bs = q.shape[0]
         if bs > 64:
             raise ValueError(f"decode bs {bs} exceeds adapter sizing")
-        if self.rdna_decode_bufs is None:
-            key_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            self.rdna_decode_bufs = RdnaVerifyBuffers(
+        key_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        block_q_d = 16 // (q.shape[1] // key_buf.shape[1])
+        decode_key = (q.shape[1], q.shape[2], layer.v_head_dim, 1, block_q_d)
+        if decode_key not in self.rdna_decode_bufs:
+            self.rdna_decode_bufs[decode_key] = RdnaVerifyBuffers(
                 device=q.device,
                 max_bs=64,
                 max_pages=self.max_context_len + 32,
                 num_draft_tokens=1,
                 h_q=q.shape[1],
                 head_dim=q.shape[2],
-                block_q=16 // (q.shape[1] // key_buf.shape[1]),
+                block_q=block_q_d,
                 segments=64,  # offline sweep 12.139: 243->108us @16k
                 head_dim_v=layer.v_head_dim,
             )
+        rdna_decode_bufs = self.rdna_decode_bufs[decode_key]
 
         rdna_verify_fwd(
             q,
@@ -2080,7 +2095,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices,
             forward_batch.seq_lens,
             layer.scaling,
-            self.rdna_decode_bufs,
+            rdna_decode_bufs,
             bs,
             1,
         )

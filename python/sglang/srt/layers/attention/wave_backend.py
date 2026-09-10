@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import get_bool_env_var, get_device_core_count
+from sglang.srt.utils import get_bool_env_var, get_device_core_count, is_rdna_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -113,9 +113,13 @@ class WaveAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
+        _kv_splits_env = envs.SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS.get()
+        if _kv_splits_env is not None and not is_rdna_supported():
+            # M18: gfx1100-tuned override must not silently re-tune CDNA.
+            _kv_splits_env = None
         self.max_kv_splits = (
-            envs.SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS.get()
-            if envs.SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS.get() is not None
+            _kv_splits_env
+            if _kv_splits_env is not None
             else get_exec().kernel.triton_attention_num_kv_splits
         )
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]

@@ -16,7 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_host_cpu_arm64
+from sglang.srt.utils.common import is_host_cpu_arm64, is_rdna_supported
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,11 @@ def handle_mps_backends(server_args: Any):
 def handle_amd_specifics(server_args: Any):
     if get_platform().is_hip:
         splits = envs.SGLANG_TRITON_ATTENTION_NUM_KV_SPLITS.get()
+        if splits is not None and not is_rdna_supported():
+            # M18 (round-3 review): this override is tuned for gfx1100; on
+            # CDNA it would silently re-tune MI300/gfx942 with an RDNA
+            # value, so it only applies on RDNA targets.
+            splits = None
         if splits is None:
             splits = 16
         declare_resolution(

@@ -1322,6 +1322,15 @@ def _lean_num_cus() -> int:
 
     Lean Attention sizes its persistent grid to the hardware CU count so work-stealing can
     fill the GPU. Falls back to 304 (MI300X) if the device cannot be queried.
+
+    NOTE (round-3 review M11, measured): multi_processor_count is the WGP
+    count on RDNA (48 on gfx1100, i.e. half the 96 CUs), so this grid runs
+    one CTA per WGP, not per CU. That is deliberate: doubling the grid to
+    the CU count (get_device_core_count) was A/B-tested on gfx1100 with
+    DFlash2 at bs=1 and regressed decode TG ~8% (94 -> 87 tok/s at depth 0;
+    math suite 167.5 vs 169.7 avg) -- the extra CTAs cost more in split-KV
+    partials than they return at small batch. Tune via
+    SGLANG_FORCE_LEAN_GRID_CU_MULT instead of changing the semantic here.
     """
     global _NUM_CU
     if _NUM_CU is None:

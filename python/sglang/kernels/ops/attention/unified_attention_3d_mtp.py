@@ -58,7 +58,7 @@ except ImportError:
 
 import os as _os
 
-from sglang.srt.utils import get_hip_version, is_gfx95_supported
+from sglang.srt.utils import get_device_core_count, get_hip_version, is_gfx95_supported
 
 
 def asm_verify_attn_enabled() -> bool:
@@ -740,9 +740,12 @@ def unified_attention_3d_mtp_func(
     total_num_q_blocks = num_tokens // block_q + num_seqs
     num_2d_programs = total_num_q_blocks * num_kv_heads
 
-    num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+    # CU count via the shared helper (round-3 review M11): the raw
+    # multi_processor_count is WGP count on RDNA, so the previous
+    # `num_cus * 2` equalled one CTA per CU here but two on CDNA.
+    num_cus = get_device_core_count(q.device.index or 0)
     max_segments = min(64, math.ceil(max_seqlen_k / tile_size))
-    parallel_segments = math.ceil(num_cus * 2 / max(1, num_2d_programs))
+    parallel_segments = math.ceil(num_cus / max(1, num_2d_programs))
     work_segments = math.ceil(max_seqlen_k / (tile_size * 32))
     work_segments = min(work_segments, parallel_segments * 8)
     num_segments = min(max_segments, max(8, parallel_segments, work_segments))
