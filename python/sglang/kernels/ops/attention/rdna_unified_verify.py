@@ -585,6 +585,13 @@ def unified_attention_diffkv(
         BLOCK_M=BLOCK_M,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         IS_3D=use_3d,
+        # 3D (decode/spec-verify, max_seqlen_q<=16) runs best at 2 warps:
+        # A/B on gfx1100 (bench_m16_spills.py, bs 1-8, ctx 0.5k-16k, MLE
+        # 1/4, bit-exact output): verify -4.6%..-41.5% in all five cases;
+        # decode mixed/noisy +-20%, accepted on the verify-dominance of
+        # DFlash2 steps and validated end-to-end. 2D (prefill/extend)
+        # keeps the default 4. num_warps=8 measured +56% (rejected).
+        num_warps=2 if use_3d else 4,
     )
 
     if use_3d:
