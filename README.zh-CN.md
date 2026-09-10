@@ -180,7 +180,7 @@ python -m sglang.launch_server \
 DFlash2 相比上方 MTP-3 配方的关键差异：
 
 - 草稿模型为独立的 **Qwen3.8-27B-DFlash2** 权重（5 层草稿网络，HF Hub 上的
-  `incoai/Qwen3.8-27B-DFlash2`），通过 `--speculative-draft-model-quantization unquant`
+  [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)），通过 `--speculative-draft-model-quantization unquant`
   以非量化方式加载，不继承目标模型的 W4A16 量化配置。
 - `--speculative-num-draft-tokens 8`（7 token 草稿块 + 1），配合
   `--speculative-draft-window-size 2048` 滑动草稿窗口。
@@ -192,6 +192,17 @@ DFlash2 相比上方 MTP-3 配方的关键差异：
 （GSM8K/MATH-500），120k Agentic 会话回放平均生成速度约 84 tok/s，16k 上下文深度
 TG 保持率约 97%（两次运行取平均）。
 
+**W4A16 草稿模型变体（2026-09-10）：**
+[`syvai/Qwen3.8-27B-DFlash2-W4A16`](https://huggingface.co/syvai/Qwen3.8-27B-DFlash2-W4A16)
+已按与目标模型相同的 compressed-tensors W4A16 方案预量化草稿网络——将
+`SGLANG_DFLASH2_PATH` 指向该权重并把 `SGLANG_DFLASH2_QUANT` 置空（覆盖默认的
+`unquant`），让权重自带的量化配置生效。草稿网络显存从 2.09 降至 **1.04
+GiB/GPU**，KV 容量从 189,172 提升至 **217,746 tokens**（+15.1%），接受长度与
+bf16 持平（单并发 3.30–3.34，c=4 时 3.27）。为此需要两处加载器改动：drafter 中
+保持非量化的普通参数（`fc` 及 ignore-list 投影）在加载时从 packed 三元组反量化；
+融合上下文 KV 路径通过 one-hot GPTQ GEMM 从 packed qkv 权重还原稠密 K/V 行
+（实测见下方第 5 节）。
+
 ---
 
 ## 实测性能基准对比
@@ -200,6 +211,8 @@ TG 保持率约 97%（两次运行取平均）。
 SGLang 侧数据于 2026-09-09 在当前合并重建后的构建上刷新（`llama-benchy` 0.4.0）；
 深度曲线与 120k 回放为两次运行取平均，DFlash2 数学与 c=4 为单次采样。
 vLLM 基线列为早期实测数据，如需精确对比请使用相同工具版本重新压测。
+上方 DFlash2 列为 bf16 草稿模型；第 5 节为 W4A16 草稿模型的同配置复测
+（2026-09-10，启用融合 KV 物化）。
 
 ### 1. 标准化上下文深度衰减测试 (`llama-benchy`)
 *标准 Prompt Prefill ($PP=2048$) 与 Token Generation ($TG=128$), 并发数 = 1*
@@ -262,6 +275,40 @@ vLLM 基线列为早期实测数据，如需精确对比请使用相同工具版
 | **llama.cpp (MTP)** | c = 4 | 636.3 tok/s | 50.1 tok/s | — | 受限于插槽并发队列瓶颈 (`-np 2`) |
 
 > **多并发核心结论**：SGLang 两套推测解码在 RDNA3 上 4 并发均保持 **100% 稳定**——无非法显存访问、无图捕获失败（vLLM 原生 MTP-3 在 batch > 1 时仍会崩溃）。DFlash2 以 **92.1 tok/s** 总生成吞吐领先（较 vLLM 无投机基线 +10.8%，较 vLLM DFlash2 +21.3%），峰值 **146 tok/s**；MTP-3 为 78.5 tok/s。vLLM 基线列为旧版 `llama-benchy` 实测，引用精确跨引擎对比前请用 0.4.0 重新压测基线。
+
+### 5. W4A16 草稿模型（[`syvai/Qwen3.8-27B-DFlash2-W4A16`](https://huggingface.co/syvai/Qwen3.8-27B-DFlash2-W4A16)，融合 KV）
+*2026-09-10，同一硬件与 `llama-benchy` 0.4.0。深度曲线与 120k 回放在无外部流量的
+隔离端口实测；数学、c=4、深上下文与多模态取自 2026-09-09 套件（顺序 KV 路径——
+准确率与该路径无关，融合 KV 仅影响草稿上下文 KV 构建）。*
+
+**深度曲线**（PP=2048/TG=128，c=1；两次运行取平均，16k 为三次采样均值）：
+
+| 指标 | bf16 草稿模型（第 1 节） | W4A16 草稿模型（融合 KV） |
+|:---|:---:|:---:|
+| **Depth 0** | 107.9 tok/s | 118.9 tok/s |
+| **Depth 4,096** | 96.8 tok/s | 98.9 tok/s |
+| **Depth 8,192** | 97.7 tok/s | 95.9 tok/s |
+| **Depth 16,384** | 105.1 tok/s | 98.0 tok/s |
+| **速度留存率 (16k / 0k)** | 97.4% | 82.4% |
+
+> 本机单次采样 TG 波动约 ±15 tok/s（深度 0 的背靠背采样分别读得 101.7 与 136.1），解读单点数据时请保留该误差量级。在同一隔离端口关闭融合 KV 后，16k 均值降至 88.1 tok/s——融合 KV 在深度场景带来约 +11% 收益，并将与 bf16 草稿模型的 16k 留存率差距基本抹平。
+
+**120k Agentic 会话回放**（两次运行，融合 KV）：平均 **88.6 tok/s**、中位数
+**82.8 tok/s**、CV **25.3%**、最差轮次 **52.5 tok/s**——bf16 草稿模型为
+83.8 / 79.8 / 23.0% / 40.6，平均速度持平或略优。
+
+**数学思维链**（greedy，单次运行）：3/4 正确——与 bf16 草稿模型出现 *相同的*
+GSM8K #1 失误（答 96，正确 72），量化草稿模型未带来额外精度损失。平均 TG
+**148.9 tok/s**（63 token 的 GSM8K #1 短答案拉低均值至 54.0 tok/s；其余三题
+为 155–200 tok/s）。
+
+**深上下文扩展**（单次运行，10k→160k TG）：78.4 / 117.3 / 90.4 / 86.1 / 60.1 /
+39.0 tok/s——约 80k 之后 TG 开始衰减，与该窗口式草稿家族的长上下文行为一致。
+
+**c=4 多并发：** 总 TG **89.3 tok/s**、峰值 **121 tok/s**、PP **1,266 tok/s**、
+100% 稳定（bf16 草稿模型：92.1 / 146.0 / 1,275.5）。
+
+**多模态矩阵：** 单图 / 多图与多轮交错工作负载均无循环 / 格式缺陷。
 
 ---
 
