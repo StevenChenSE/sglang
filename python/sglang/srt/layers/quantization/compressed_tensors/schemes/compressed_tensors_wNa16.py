@@ -453,14 +453,12 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         if _is_rdna3:
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
             out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
-            # fp16 path iff this layer's scales are fp16 (E1, set per layer
-            # in _process_weights_after_loading_rdna3); no-op when serving
-            # dtype is fp16.
-            gemm_x = x_2d
-            if w_s.dtype == torch.float16 and x_2d.dtype != torch.float16:
-                gemm_x = x_2d.to(torch.float16)
+            # E1 fused-cast path: with fp16 scales the kernel's mixed
+            # instantiation takes bf16 activations directly (fp16 compute
+            # in-register, bf16 output). fp16 serving passes fp16/fp16 and
+            # takes the native half path.
             output = _rdna3_gptq_gemm(
-                gemm_x,
+                x_2d,
                 w_q,
                 w_zp,
                 w_s,
@@ -468,8 +466,6 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                 True,  # use_shuffle: weights are pre-shuffled (exllama layout)
                 c.weight_type.size_bits,
             )
-            if gemm_x is not x_2d:
-                output = output.to(x.dtype)
             if bias is not None:
                 output = output + bias
             return output.reshape(out_shape)

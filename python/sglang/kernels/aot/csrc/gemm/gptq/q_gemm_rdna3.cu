@@ -240,6 +240,15 @@ __forceinline__ __device__ void load4_zeros(const uint32_t* qzeros_row, int n,
   zeros[3] = (int)((d >> 12) & 0xF);
 }
 
+// bf16 bits -> half, for the mixed-precision instantiation (A_IN_BF16): the
+// caller serves bf16 activations against fp16 scales. Identical rounding to
+// the standalone bf16->fp16 cast kernel this fusion replaces, but issued at
+// LDS-store time — once per staged element, outside the dot-product inner
+// loop — instead of as a separate global-memory round trip per GEMM.
+__forceinline__ __device__ half bf16_bits_to_half(uint16_t bits) {
+  return __float2half_rn(__uint_as_float(uint32_t(bits) << 16));
+}
+
 template <typename T>
 __forceinline__ __device__ void load4_scales(const T* scales_row, int n,
                                              T (&scales)[4]) {
@@ -253,7 +262,7 @@ __forceinline__ __device__ void load4_scales(const T* scales_row, int n,
 // Main kernel.
 // ---------------------------------------------------------------------------
 
-template <typename T, int M_COUNT>
+template <typename T, int M_COUNT, bool A_IN_BF16 = false>
 __global__ void gemm_q4_kernel_rdna3(
     const T* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
@@ -298,11 +307,19 @@ __global__ void gemm_q4_kernel_rdna3(
       for (int m = 0; m < M_COUNT; ++m) {
         T av;
         if (offset_m + m < size_m) {
-          const T* a_row = a + (offset_m + m) * size_k;
-          if (b_q_perm)
-            av = a_row[b_q_perm[offset_k + t]];
-          else
-            av = a_row[offset_k + t];
+          const int a_idx =
+              b_q_perm ? b_q_perm[offset_k + t] : (offset_k + t);
+          if constexpr (A_IN_BF16) {
+            // Mixed instantiation: a points at bf16 bits (same 2B stride),
+            // convert to the fp16 compute dtype on the way into LDS.
+            const uint16_t* a_row =
+                reinterpret_cast<const uint16_t*>(a) +
+                (offset_m + m) * size_k;
+            av = bf16_bits_to_half(a_row[a_idx]);
+          } else {
+            const T* a_row = a + (offset_m + m) * size_k;
+            av = a_row[a_idx];
+          }
         } else {
           av = tzero<T>();  // zero-pad invalid M rows
         }
@@ -601,7 +618,18 @@ __global__ void gemm_q4_kernel_rdna3(
   for (int m = 0; m < M_COUNT; ++m) {
     if (offset_m + m >= size_m) continue;  // skip padding rows past size_m
     T* out = c + (offset_m + m) * size_n + n;
-    if constexpr (std::is_same<T, half>::value) {
+    if constexpr (A_IN_BF16) {
+      // Mixed instantiation: c is bf16 memory (same 2B element as T=half).
+      // Accumulate fp32, round once to bf16, atomic-add into the bf16
+      // output — the fp16->bf16 output cast kernel disappears with it.
+      bf16_t* out_b = reinterpret_cast<bf16_t*>(out);
+      bf162_t r01, r23;
+      r01.x = __float2bfloat16(block_c[m][0]);
+      r01.y = __float2bfloat16(block_c[m][1]);
+      r23.x = __float2bfloat16(block_c[m][2]);
+      r23.y = __float2bfloat16(block_c[m][3]);
+      atomic_add_pk4_bf16(out_b, r01, r23);
+    } else if constexpr (std::is_same<T, half>::value) {
       half2 r01 = __halves2half2(__float2half_rn(block_c[m][0]),
                                  __float2half_rn(block_c[m][1]));
       half2 r23 = __halves2half2(__float2half_rn(block_c[m][2]),
@@ -621,7 +649,7 @@ __global__ void gemm_q4_kernel_rdna3(
 
 #else  // non-RDNA3 device pass: empty __global__ for symbol parity.
 
-template <typename T, int M_COUNT>
+template <typename T, int M_COUNT, bool A_IN_BF16 = false>
 __global__ void gemm_q4_kernel_rdna3(const T*, const uint32_t*, const uint32_t*,
                                      const T*, T*, const int, const int,
                                      const int, const int, const int,
@@ -633,7 +661,7 @@ __global__ void gemm_q4_kernel_rdna3(const T*, const uint32_t*, const uint32_t*,
 // Launcher.
 // ---------------------------------------------------------------------------
 
-template <typename T, int M_COUNT>
+template <typename T, int M_COUNT, bool A_IN_BF16 = false>
 void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
                                const uint32_t* b_qzeros, const T* b_scales,
                                const int* b_q_perm, T* c, int size_m,
@@ -644,7 +672,7 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
             (size_m + M_COUNT - 1) / M_COUNT,
             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
 
-  gemm_q4_kernel_rdna3<T, M_COUNT><<<grid, block, 0, stream>>>(
+  gemm_q4_kernel_rdna3<T, M_COUNT, A_IN_BF16><<<grid, block, 0, stream>>>(
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
 }
@@ -687,6 +715,49 @@ void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
     launch_gemm_q4_for_mcount<T, 8>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
                                     c, size_m, size_n, size_k, groups,
                                     zero_offset, stream);
+  }
+}
+
+// Mixed-precision entry (E1 fused cast, review 2026-09-09): bf16 activations,
+// fp16 scales/compute, bf16 output in one kernel launch. The wrapper used to
+// pair the fp16 path with standalone bf16->fp16 / fp16->bf16 cast kernels —
+// two extra graph nodes and ~20us of global-memory round trip per GEMM call
+// site. Same template ladder as launch_gemm_q4.
+template <int M_COUNT>
+void launch_gemm_q4_mixed(const void* a, const uint32_t* b_q_weight,
+                          const uint32_t* b_qzeros, const half* b_scales,
+                          const int* b_q_perm, void* c, int size_m, int size_n,
+                          int size_k, int groups, int zero_offset,
+                          cudaStream_t stream) {
+  launch_gemm_q4_for_mcount<half, M_COUNT, true>(
+      reinterpret_cast<const half*>(a), b_q_weight, b_qzeros, b_scales,
+      b_q_perm, reinterpret_cast<half*>(c), size_m, size_n, size_k, groups,
+      zero_offset, stream);
+}
+
+void launch_gemm_q4_mixed(const void* a, const uint32_t* b_q_weight,
+                          const uint32_t* b_qzeros, const half* b_scales,
+                          const int* b_q_perm, void* c, int size_m, int size_n,
+                          int size_k, int groups, bool use_v2_format,
+                          cudaStream_t stream) {
+  const int zero_offset = use_v2_format ? 0 : 1;
+
+  if (size_m == 1) {
+    launch_gemm_q4_mixed<1>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
+                            size_m, size_n, size_k, groups, zero_offset,
+                            stream);
+  } else if (size_m <= 3) {
+    launch_gemm_q4_mixed<2>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
+                            size_m, size_n, size_k, groups, zero_offset,
+                            stream);
+  } else if (size_m <= 7) {
+    launch_gemm_q4_mixed<4>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
+                            size_m, size_n, size_k, groups, zero_offset,
+                            stream);
+  } else {
+    launch_gemm_q4_mixed<8>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
+                            size_m, size_n, size_k, groups, zero_offset,
+                            stream);
   }
 }
 
@@ -736,8 +807,13 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
   TORCH_CHECK(
       a.scalar_type() == torch::kHalf || a.scalar_type() == torch::kBFloat16,
       "a must be half or bfloat16");
-  TORCH_CHECK(a.scalar_type() == b_scales.scalar_type(),
-              "b_scales dtype must match a");
+  // E1 fused path: bf16 activations against fp16 scales are legal — the
+  // scalar kernel converts A to fp16 in-register (A_IN_BF16 instantiation).
+  TORCH_CHECK(a.scalar_type() == b_scales.scalar_type() ||
+                  (a.scalar_type() == torch::kBFloat16 &&
+                   b_scales.scalar_type() == torch::kHalf),
+              "b_scales dtype must match a (or be fp16 for the fused bf16-a "
+              "path)");
   // The kernels index a/b_q_weight/b_qzeros/b_scales with dense
   // row-major strides; a non-contiguous tensor would read garbage (and
   // possibly out of bounds). The WMMA entry enforces the same set.
@@ -749,16 +825,33 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
 
+  // E1 mixed combo: bf16 activations, fp16 scales.
+  const bool mixed_e1 =
+      (a.scalar_type() == torch::kBFloat16 &&
+       b_scales.scalar_type() == torch::kHalf);
+
   // Metadata-only dispatch test; the WMMA TU re-validates under its own
   // guard, which is now guaranteed to be a's device.
   // SGL_FORCE_SCALAR_GPTQ=1 routes every shape to the scalar kernel below —
   // counterfactual switch for the WMMA-wedge bisect (12.165).
-  if (a.dim() == 2 && b_q_weight.dim() == 2 &&
+  if (!mixed_e1 &&
+      a.dim() == 2 && b_q_weight.dim() == 2 &&
       a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0 &&
       ((a.scalar_type() == torch::kBFloat16 && a.size(0) >= 16) ||
        (a.scalar_type() == torch::kHalf && a.size(0) >= 64))) {
     return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
                                 use_v2_format);
+  }
+  if (mixed_e1 && a.dim() == 2 && b_q_weight.dim() == 2 &&
+      a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0 &&
+      a.size(0) >= 64) {
+    // WMMA-class prefill M: the GEMM there amortizes a cast, so hand WMMA a
+    // fp16 copy of A (scales are already fp16) and cast the result back —
+    // numerically identical to the pre-fusion fp16 prefill path.
+    auto a_h = a.to(torch::kHalf);
+    auto out_h = gptq_gemm_rdna3_wmma(a_h, b_q_weight, b_qzeros, b_scales,
+                                      b_g_idx, use_v2_format);
+    return out_h.to(torch::kBFloat16);
   }
 
   // The scalar device body is compiled only for the gfx1100 code object
@@ -810,7 +903,13 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
     g_idx_ptr = (const int*)b_g_idx.data_ptr();
   }
 
-  if (a.scalar_type() == torch::kHalf) {
+  if (mixed_e1) {
+    vllm::gptq_rdna3::launch_gemm_q4_mixed(
+        a.data_ptr(), (const uint32_t*)b_q_weight.data_ptr(),
+        (const uint32_t*)b_qzeros.data_ptr(), (const half*)b_scales.data_ptr(),
+        g_idx_ptr, c.data_ptr(), size_m, size_n, size_k, groups, use_v2_format,
+        stream);
+  } else if (a.scalar_type() == torch::kHalf) {
     vllm::gptq_rdna3::launch_gemm_q4<half>(
         (const half*)a.data_ptr(), (const uint32_t*)b_q_weight.data_ptr(),
         (const uint32_t*)b_qzeros.data_ptr(), (const half*)b_scales.data_ptr(),

@@ -159,14 +159,13 @@ class GPTQLinearKernel:
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
 
-        # fp16 path iff THIS layer's scales are fp16 (set per layer in
-        # process_weights_after_loading). When serving dtype is fp16 the
-        # cast is a no-op on both ends.
-        gemm_x = reshaped_x
-        if layer.scales.dtype == torch.float16 and reshaped_x.dtype != torch.float16:
-            gemm_x = reshaped_x.to(torch.float16)
+        # E1 fused-cast path: the kernel's mixed instantiation takes bf16
+        # activations against fp16 scales directly (converts A in-register,
+        # writes bf16 C), so no cast kernels and no dtype juggling here.
+        # fp16 scales + fp16 activations (fp16 serving) take the native half
+        # path; bf16 scales + bf16 activations take the bf16 path.
         output = gptq_gemm(
-            gemm_x,
+            reshaped_x,
             layer.qweight,
             layer.qzeros,
             layer.scales,
@@ -175,8 +174,6 @@ class GPTQLinearKernel:
             self.quant_config.weight_bits,
             self.use_v2_format,
         )
-        if gemm_x is not reshaped_x:
-            output = output.to(x.dtype)
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
