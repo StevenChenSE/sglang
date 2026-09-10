@@ -750,6 +750,12 @@ class CustomAllreduce {
         } else {                                                                       \
           KL(ngpus, cross_device_reduce_2stage);                                       \
         }                                                                              \
+      } else {                                                                         \
+        /* RDNA fork (REVIEW 2026-09-10 C1): with full_nvlink_=false and       \
+         * world_size_>2 no kernel launches and the caller's empty_like       \
+         * output would be returned uninitialized. Fail loudly. */            \
+        TORCH_CHECK(false, "custom all-reduce: no launch path for world_size=", \
+                    world_size_, " full_nvlink=", full_nvlink_);                \
       }                                                                                \
     }                                                                                  \
     break;                                                                             \

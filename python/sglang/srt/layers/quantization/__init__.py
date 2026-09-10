@@ -52,6 +52,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_hip,
     is_mps,
     is_npu,
     is_xpu,
@@ -75,11 +76,6 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
-    # gfx1100 fork: keep plain "gptq" registered. Upstream removed it together
-    # with the CUDA exllama kernel (#32114); here it dispatches to the RDNA3
-    # GPTQLinearKernel in hardware_backend/gpu/quantization/gptq_kernels.py.
-    # Platform-specific registrations below still override this key.
-    "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
@@ -104,6 +100,20 @@ if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
+        }
+    )
+
+
+if is_hip():
+    # gfx1100 fork: keep plain "gptq" registered on ROCm only. Upstream removed
+    # it together with the CUDA exllama kernel (#32114); here it dispatches to
+    # the RDNA3 GPTQLinearKernel in hardware_backend/gpu/quantization/
+    # gptq_kernels.py. On CUDA, plain gptq now fails fast with upstream's
+    # "unknown quantization method" instead of inside a HIP-only kernel
+    # (REVIEW 2026-09-10 M17). Platform blocks below still override the key.
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQConfig,
         }
     )
 

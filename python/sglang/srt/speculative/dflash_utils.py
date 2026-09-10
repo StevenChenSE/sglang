@@ -834,6 +834,18 @@ def can_dflash_dequant_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     one-hot dequantization. Requires the RDNA3 GPTQ packed layout produced by
     process_weights_after_loading (weight_packed [K/8, N] + scales + zeros +
     g_idx) and no bias."""
+    # Name-based detection alone would also match CUDA/CDNA compressed-tensors
+    # Marlin-packed layers (same attribute names, repacked payload) — gate on
+    # the RDNA3 kernel actually being the loaded backend (REVIEW 2026-09-10
+    # M12); the shape guards in dequantize_gptq_kv_rows catch the rest loudly.
+    from sglang.srt.utils.common import is_rdna_supported
+
+    if not is_rdna_supported():
+        return (
+            False,
+            "one-hot GPTQ dequant requires the RDNA3 gptq_gemm kernel "
+            f"(gcn_arch={getattr(qkv_proj, 'gcn_arch', 'n/a')})",
+        )
     for name in ("weight_packed", "weight_scale", "weight_shape", "weight_g_idx"):
         if getattr(qkv_proj, name, None) is None:
             return (
@@ -850,7 +862,7 @@ def dequantize_gptq_kv_rows(
     qkv_proj: Any,
     q_size: int,
     kv_size: int,
-    out_dtype: torch.dtype = torch.bfloat16,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Recover dense [2*kv_size, in_features] K/V rows from a packed RDNA3 GPTQ
     qkv_proj.
@@ -866,6 +878,11 @@ def dequantize_gptq_kv_rows(
     w_zp = qkv_proj.weight_zero_point
     w_s = qkv_proj.weight_scale
     g_idx = qkv_proj.weight_g_idx
+    # The kernel requires a.dtype == b_scales.dtype (TORCH_CHECK); default the
+    # activation dtype to the scales' instead of hardcoding bf16, which raised
+    # and disabled the feature for fp16-scale checkpoints (REVIEW M12).
+    if out_dtype is None:
+        out_dtype = w_s.dtype
     in_features = int(qkv_proj.weight_shape[1])
     out_features = int(w_q.shape[1])
     if out_features != q_size + 2 * kv_size:

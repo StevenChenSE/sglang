@@ -269,7 +269,8 @@ torch::Tensor gptq_gemm(
     torch::Tensor b_gptq_scales,
     torch::Tensor b_g_idx,
     bool use_shuffle,
-    int64_t bit);
+    int64_t bit,
+    bool use_v2_format);
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 

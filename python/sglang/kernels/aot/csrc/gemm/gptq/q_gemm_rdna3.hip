@@ -738,6 +738,14 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
       "a must be half or bfloat16");
   TORCH_CHECK(a.scalar_type() == b_scales.scalar_type(),
               "b_scales dtype must match a");
+  // The kernels index a/b_q_weight/b_qzeros/b_scales with dense
+  // row-major strides; a non-contiguous tensor would read garbage (and
+  // possibly out of bounds). The WMMA entry enforces the same set.
+  TORCH_CHECK(a.is_contiguous(), "a must be contiguous");
+  TORCH_CHECK(b_q_weight.is_contiguous(), "b_q_weight must be contiguous");
+  TORCH_CHECK(b_qzeros.is_contiguous(), "b_qzeros must be contiguous");
+  TORCH_CHECK(b_scales.is_contiguous(), "b_scales must be contiguous");
+  TORCH_CHECK(b_g_idx.is_contiguous(), "b_g_idx must be contiguous");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
 
@@ -751,6 +759,20 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
        (a.scalar_type() == torch::kHalf && a.size(0) >= 64))) {
     return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
                                 use_v2_format);
+  }
+
+  // The scalar device body is compiled only for the gfx1100 code object
+  // (REVIEW 2026-09-10 H4): a build for gfx1151/gfx1201 carries an empty
+  // stub here, which would return the pre-zeroed output. Anything that
+  // falls through the WMMA dispatch above on a non-gfx1100 device must
+  // fail loudly instead.
+  {
+    const auto* dprops = at::cuda::getCurrentDeviceProperties();
+    const std::string device_arch = dprops->gcnArchName;
+    TORCH_CHECK(device_arch.rfind("gfx1100", 0) == 0,
+                "gptq_gemm_rdna3 scalar kernel body is only compiled for "
+                "gfx1100; current device is ", device_arch,
+                " and this shape missed the WMMA dispatch");
   }
 
   auto stream = at::cuda::getCurrentCUDAStream();

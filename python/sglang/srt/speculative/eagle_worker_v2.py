@@ -148,18 +148,25 @@ def _vocab_parallel_top1(logits: torch.Tensor):
     Returns (topk_p, topk_index) matching the eager topk==1 contract: topk_p
     is ones (unused without rejection sampling).
     """
-    from sglang.srt.distributed import (
-        get_tensor_model_parallel_world_size,
-        get_tp_group,
-    )
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+    from sglang.srt.runtime_context import get_parallel
 
     local_idx = logits.argmax(dim=-1, keepdim=True)
     local_val = logits.gather(-1, local_idx)
-    tp_size = get_tensor_model_parallel_world_size()
+    # Under DP attention logits are sharded over the attention-TP group, not
+    # the full TP group; reducing over the full group would all-gather logits
+    # of unrelated DP requests (REVIEW 2026-09-10 H2). Same selection as the
+    # verify path in eagle_utils.
+    tp = (
+        get_parallel().attn_tp_group
+        if is_dp_attention_enabled()
+        else get_tp_group()
+    )
+    tp_size = tp.world_size
     if tp_size == 1:
         return torch.ones_like(local_idx, dtype=torch.float32), local_idx
     local_size = logits.shape[-1]
-    tp = get_tp_group()
     packed = torch.cat(
         [local_val, (local_idx + tp.rank * local_size).to(torch.float32)], dim=-1
     )

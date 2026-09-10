@@ -164,7 +164,8 @@ __global__ void moe_gemm_q4_kernel_rdna3(
     const int expert_scales_stride,  // groups * N
     const int expert_zeros_stride,   // groups * (N/8)
     const bool mul_topk_weight,
-    const int output_topk) {  // >0: reduce output by token_id/output_topk
+    const int output_topk,  // >0: reduce output by token_id/output_topk
+    const int num_experts) {
   const int t = threadIdx.x;
   const int token_block = blockIdx.x;
   const int offset_n = blockIdx.y * BLOCK_KN_SIZE * 4;
@@ -176,13 +177,11 @@ __global__ void moe_gemm_q4_kernel_rdna3(
   if (token_block * BLOCK_SIZE_M >= num_tokens_post_padded[0]) return;
 
   const int expert_id = expert_ids[token_block];
-  // NOTE when wiring this kernel to sglang's moe_align_block_size: that
-  // launcher uses num_experts + 1 buckets, so tokens routed to an invalid
-  // expert land in bucket `num_experts` (not -1). This kernel receives no
-  // expert count, so such a block would read weights past b_q_weight. If
-  // invalid experts are not ignored upstream, thread num_experts in and
-  // bail on expert_id >= num_experts here before dereferencing.
-  if (expert_id == -1) return;
+  // moe_align_block_size buckets invalid experts in bucket `num_experts`
+  // (and some producers still emit -1); either would index weights past
+  // b_q_weight. The entry derives the bound from b_q_weight.size(0)
+  // (REVIEW 2026-09-10 H5).
+  if (expert_id < 0 || expert_id >= num_experts) return;
 
   // Expert-specific pointers
   const uint32_t* expert_weights =
@@ -485,7 +484,7 @@ __global__ void moe_gemm_q4_kernel_rdna3(
     const T*, T*, const uint32_t*, const T*, const uint32_t*, const float*,
     const int32_t*, const int32_t*, const int32_t*, const int, const int,
     const int, const int, const int, const int, const int, const int,
-    const bool, const int) {}
+    const bool, const int, const int) {}
 
 #endif  // __HIP__RDNA3__ || !__HIP_DEVICE_COMPILE__
 
@@ -501,7 +500,7 @@ void launch_moe_gemm_q4(
     const int32_t* num_tokens_post_padded, int num_token_blocks, int size_m,
     int size_n, int size_k, int groups, int top_k, int expert_weight_stride,
     int expert_scales_stride, int expert_zeros_stride, bool mul_topk_weight,
-    int output_topk, hipStream_t stream) {
+    int output_topk, int num_experts, hipStream_t stream) {
   dim3 block(THREADS_X);
   dim3 grid(num_token_blocks,
             (size_n + BLOCK_KN_SIZE * 4 - 1) / (BLOCK_KN_SIZE * 4),
@@ -511,7 +510,7 @@ void launch_moe_gemm_q4(
       a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
       expert_ids, num_tokens_post_padded, size_m, size_n, size_k, groups, top_k,
       expert_weight_stride, expert_scales_stride, expert_zeros_stride,
-      mul_topk_weight, output_topk);
+      mul_topk_weight, output_topk, num_experts);
 }
 
 template <typename T>
@@ -522,7 +521,8 @@ void dispatch_moe_gemm_q4(
     const int32_t* num_tokens_post_padded, int num_token_blocks, int size_m,
     int size_n, int size_k, int groups, int top_k, int block_size_m,
     int expert_weight_stride, int expert_scales_stride, int expert_zeros_stride,
-    bool mul_topk_weight, int output_topk, hipStream_t stream) {
+    bool mul_topk_weight, int output_topk, int num_experts,
+    hipStream_t stream) {
   // Dispatch to template instantiation based on block_size_m
   switch (block_size_m) {
     case 1:
@@ -530,28 +530,32 @@ void dispatch_moe_gemm_q4(
           a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
           expert_ids, num_tokens_post_padded, num_token_blocks, size_m, size_n,
           size_k, groups, top_k, expert_weight_stride, expert_scales_stride,
-          expert_zeros_stride, mul_topk_weight, output_topk, stream);
+          expert_zeros_stride, mul_topk_weight, output_topk, num_experts,
+          stream);
       break;
     case 2:
       launch_moe_gemm_q4<T, 2>(
           a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
           expert_ids, num_tokens_post_padded, num_token_blocks, size_m, size_n,
           size_k, groups, top_k, expert_weight_stride, expert_scales_stride,
-          expert_zeros_stride, mul_topk_weight, output_topk, stream);
+          expert_zeros_stride, mul_topk_weight, output_topk, num_experts,
+          stream);
       break;
     case 4:
       launch_moe_gemm_q4<T, 4>(
           a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
           expert_ids, num_tokens_post_padded, num_token_blocks, size_m, size_n,
           size_k, groups, top_k, expert_weight_stride, expert_scales_stride,
-          expert_zeros_stride, mul_topk_weight, output_topk, stream);
+          expert_zeros_stride, mul_topk_weight, output_topk, num_experts,
+          stream);
       break;
     case 8:
       launch_moe_gemm_q4<T, 8>(
           a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
           expert_ids, num_tokens_post_padded, num_token_blocks, size_m, size_n,
           size_k, groups, top_k, expert_weight_stride, expert_scales_stride,
-          expert_zeros_stride, mul_topk_weight, output_topk, stream);
+          expert_zeros_stride, mul_topk_weight, output_topk, num_experts,
+          stream);
       break;
     default:
       TORCH_CHECK(false,
@@ -643,7 +647,7 @@ void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
         num_tokens_post_padded.data_ptr<int32_t>(), num_token_blocks, size_m,
         size_n, size_k, groups, (int)top_k, (int)block_size_m,
         expert_weight_stride, expert_scales_stride, expert_zeros_stride,
-        mul_topk_weight, (int)output_topk, stream);
+        mul_topk_weight, (int)output_topk, (int)b_q_weight.size(0), stream);
   };
 
   if (a.scalar_type() == torch::kHalf) {

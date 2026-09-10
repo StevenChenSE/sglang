@@ -122,6 +122,29 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
         output_size_per_partition = sum(output_partition_sizes)
 
+        if _is_rdna3:
+            # RDNA3 GPTQ-layout repack guards (REVIEW 2026-09-10 H13): the
+            # repack indexes scales per group along K and derives g_idx via a
+            # plain argsort, which two legal compressed-tensors configs cannot
+            # express. Channelwise would drive groups = K // -1 negative in
+            # _process_weights_after_loading_rdna3; act-order + row-parallel
+            # shards scales along K while g_idx keeps full-K group ids ->
+            # silent out-of-range scale indexing. Mirror vLLM's kernel rejects
+            # loudly instead.
+            if self.group_size == -1:
+                raise ValueError(
+                    "Channelwise (group_size=-1) compressed-tensors weights "
+                    "are not supported by the RDNA3 W4A16 kernel. "
+                    "Re-quantize with a grouped scheme (e.g. group_size=128)."
+                )
+            if self.has_g_idx and input_size != input_size_per_partition:
+                raise ValueError(
+                    "compressed-tensors act-order weights are not supported "
+                    "with tensor parallelism > 1 on RDNA3 (scale partitioning "
+                    "is incompatible with full-K g_idx). Use TP=1, disable "
+                    "act-order, or use the marlin path."
+                )
+
         self.kernel_config = MarlinLinearLayerConfig(
             full_weight_shape=(input_size, output_size),
             partition_weight_shape=(

@@ -104,7 +104,7 @@ python sglang/scripts/rdna_ar/rdna_ar_ext.py
 ```bash
 export SGL_DTYPE=bfloat16
 export SGL_PHASE_TIMING=0
-export SGL_RDNA_CUSTOM_AR=1
+export SGLANG_RDNA_CUSTOM_AR=1
 export SGL_RDNA_NO_FUSED=1
 export SGL_RDNA_GEMMA_TRITON=1
 export SGL_RDNA_VLLM_VERIFY=1

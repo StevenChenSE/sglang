@@ -356,7 +356,10 @@ def _verify_combine_stage2(
         mask=mask_l[None, :],
         other=float("-inf"),
     )  # [N_SPLITS, L_EXT]
-    m_p = tl.max(lse, 0)  # [L_EXT]
+    # Floor the max: an all-empty prefix loads -inf for every split, and
+    # exp(-inf - -inf) = NaN would poison expsum/output (same floor as
+    # rdna_unified_verify.py / unified_attention_3d_mtp.py).
+    m_p = tl.maximum(tl.max(lse, 0), -3.4e38)  # [L_EXT]
     w = tl.exp(lse - m_p[None, :])  # [N_SPLITS, L_EXT]; -inf->0
     denom_p = tl.sum(w, 0)  # [L_EXT]
 
@@ -890,17 +893,31 @@ if torch.version.hip:
                 _verify_prefix_stage1_v2 as _V2_KERNEL,
             )
 
+            def _is_pow2(n: int) -> bool:
+                return n > 0 and (n & (n - 1)) == 0
+
             class _V2Launch:
-                def __init__(self, kern):
+                """v2 uses HEAD_DIM//2 in tl.arange, which Triton only accepts
+                for even powers of two; the swap used to be unconditional, so
+                an odd/non-pow2 head dim failed to compile and crashed the
+                verify path (REVIEW 2026-09-10 M4). Non-eligible head dims
+                fall back to the stock kernel."""
+
+                def __init__(self, kern, stock):
                     self._k = kern
+                    self._stock = stock
 
                 def __getitem__(self, grid):
                     def launch(*args, **kwargs):
-                        kwargs["num_warps"] = 4
-                        return self._k[grid](*args, **kwargs)
+                        head_dim = kwargs.get("HEAD_DIM")
+                        if head_dim is not None and _is_pow2(int(head_dim)):
+                            kwargs["num_warps"] = 4
+                            return self._k[grid](*args, **kwargs)
+                        return self._stock[grid](*args, **kwargs)
 
                     return launch
 
-            _verify_prefix_stage1 = _V2Launch(_V2_KERNEL)
+            _STOCK_PREFIX_STAGE1 = _verify_prefix_stage1
+            _verify_prefix_stage1 = _V2Launch(_V2_KERNEL, _STOCK_PREFIX_STAGE1)
     except Exception:
         pass

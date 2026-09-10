@@ -72,6 +72,7 @@ class RdnaVerifyBuffers:
         head_dim: int,
         block_q: int,
         segments: int = 16,
+        head_dim_v: int | None = None,
     ):
         self.max_bs = max_bs
         self.max_pages = max_pages
@@ -106,8 +107,16 @@ class RdnaVerifyBuffers:
         )
         # segm partials are TOKEN-ROW indexed (JOURNAL 12.136)
         max_tokens = max_bs * num_draft_tokens
+        # The unified kernel linearly indexes segm_output with
+        # HEAD_SIZE_V_PADDED strides (next_pow2 of the V head dim). Allocating
+        # the last dim with the same padded value keeps the layout correct and
+        # in-bounds even for DiffKV models where next_pow2(v) > qk head dim
+        # (REVIEW 2026-09-10 M5). For qk == v this equals head_dim.
+        segm_head_dim = triton.next_power_of_2(
+            head_dim_v if head_dim_v is not None else head_dim
+        )
         self.segm_output = torch.empty(
-            (max_tokens, h_q, segments, head_dim),
+            (max_tokens, h_q, segments, segm_head_dim),
             dtype=torch.float32,
             device=device,
         )

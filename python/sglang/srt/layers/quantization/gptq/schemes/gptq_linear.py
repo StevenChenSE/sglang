@@ -74,10 +74,19 @@ class GPTQLinearScheme(GPTQLinearSchemeBase):
             and self.quant_config.group_size != -1
         ):
             if self.quant_config.desc_act:
-                self.kernel.use_shuffle = False
-            else:
-                scale_and_zero_size = input_size_per_partition // group_size
-                scale_and_zero_input_dim = 0
+                # The RDNA3 GPTQ kernel only implements the shuffled standard
+                # layout; desc_act + row-parallel used to set use_shuffle=False
+                # here and then die on a TORCH_CHECK at the first forward
+                # (REVIEW 2026-09-10 H14). Fail here with an actionable
+                # message instead.
+                raise ValueError(
+                    "Plain GPTQ with desc_act=True is not supported with "
+                    "tensor parallelism > 1 on RDNA3 (the non-shuffled "
+                    "act-order layout is not implemented). Use TP=1 or a "
+                    "non-desc_act checkpoint."
+                )
+            scale_and_zero_size = input_size_per_partition // group_size
+            scale_and_zero_input_dim = 0
 
         qweight = PackedvLLMParameter(
             data=torch.empty(

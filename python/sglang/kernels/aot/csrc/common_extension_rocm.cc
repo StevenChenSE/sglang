@@ -293,7 +293,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       torch::Tensor b_gptq_scales,
       torch::Tensor b_g_idx,
       bool use_shuffle,
-      int64_t bit);
+      int64_t bit,
+      bool use_v2_format);
   extern void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
   extern torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                                        torch::Tensor b_qzeros, torch::Tensor b_scales,
@@ -313,7 +314,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
-      "use_shuffle, int bit) -> Tensor");
+      "use_shuffle, int bit, bool use_v2_format=False) -> Tensor");
   m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
 
   m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");

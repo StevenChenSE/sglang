@@ -13,9 +13,11 @@ import torch
 
 from sglang.srt.environ import envs
 
-# 12.145 host-side pool guard switch (see maybe_detect_oob)
-_POOL_GUARD = bool(os.environ.get("SGL_POOL_GUARD"))
-_WITNESS_ENABLED = bool(os.environ.get("SGL_WITNESS_CHECK"))
+# 12.145 host-side pool guard switch (see maybe_detect_oob).
+# "== 1" on purpose: bool("0") is True, so SGL_POOL_GUARD=0 used to ENABLE
+# the host-sync guard it was meant to disable (REVIEW 2026-09-10 M6).
+_POOL_GUARD = os.environ.get("SGL_POOL_GUARD", "0") == "1"
+_WITNESS_ENABLED = os.environ.get("SGL_WITNESS_CHECK", "0") == "1"
 
 logger = logging.getLogger(__name__)
 

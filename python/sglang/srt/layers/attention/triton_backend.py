@@ -2001,6 +2001,7 @@ class TritonAttnBackend(AttentionBackend):
                     layer.layer_id
                 ).shape[1]),
                 segments=32,  # offline sweep 12.139: 292->190us @16k
+                head_dim_v=layer.v_head_dim,
             )
 
         if extend_meta is not None:
@@ -2067,6 +2068,7 @@ class TritonAttnBackend(AttentionBackend):
                 head_dim=q.shape[2],
                 block_q=16 // (q.shape[1] // key_buf.shape[1]),
                 segments=64,  # offline sweep 12.139: 243->108us @16k
+                head_dim_v=layer.v_head_dim,
             )
 
         rdna_verify_fwd(
@@ -2538,6 +2540,16 @@ class TritonAttnBackend(AttentionBackend):
             and v_descale == 1.0
             and layer.qk_head_dim == layer.v_head_dim
             and kv_indices is not None
+            # REVIEW 2026-09-10 H6: rdna_verify_fwd has no softcap plumbed
+            # (defaults 0.0) and fills seq_lens from full seq_lens, so a
+            # softcapped or SWA layer would compute silently wrong attention
+            # here. The verify-path guard already rejects softcap; decode now
+            # rejects both, matching it.
+            and not logits_soft_cap
+            and not (
+                layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
+            )
         ):
             try:
                 self._rdna_unified_decode(

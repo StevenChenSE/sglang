@@ -1955,6 +1955,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        _phase_timer_pt = _get_phase_timer_pt()
         while True:
             if self.gracefully_exit:
                 break
@@ -1986,6 +1987,9 @@ class Scheduler(
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+            # Phase-timer step boundary (see event_loop_overlap note, M7).
+            _phase_timer_pt.step_done()
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -2080,6 +2084,12 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+            # End of scheduler iteration: advance the step counter so the
+            # phase timer actually flushes its accumulated CPU/GPU marks
+            # (REVIEW 2026-09-10 M7 — step_done previously had no caller,
+            # so SGL_PHASE_TIMING=1 accumulated forever and logged nothing).
+            _phase_timer_pt.step_done()
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]

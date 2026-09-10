@@ -1922,11 +1922,11 @@ torch::Tensor gptq_gemm(
     torch::Tensor b_gptq_scales,
     torch::Tensor b_g_idx,
     bool use_shuffle,
-    int64_t bit) {
+    int64_t bit, bool use_v2_format) {
 #ifdef SGL_IS_RDNA
   TORCH_CHECK(use_shuffle, "RDNA3 GPTQ kernel requires use_shuffle=true (standard GPTQ format)");
   TORCH_CHECK(bit == 4, "Only 4-bit GPTQ is supported on RDNA3");
-  return gptq_gemm_rdna3(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, false);
+  return gptq_gemm_rdna3(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_v2_format);
 #else
   // The exllama path computes through __half/hipblas-Hgemm only; a bf16
   // input would be bit-reinterpreted as fp16, so reject it up front. bf16

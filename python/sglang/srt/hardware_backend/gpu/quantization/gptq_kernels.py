@@ -92,6 +92,10 @@ class GPTQLinearKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.use_shuffle = True
+        # GPTQv2 checkpoints store raw zeros (no +1 legacy offset); the flag
+        # used to be computed in the scheme and dropped here, so v2 weights
+        # dequantized with zero+1 (REVIEW 2026-09-10 H1).
+        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # for torch.compile
@@ -128,6 +132,7 @@ class GPTQLinearKernel:
             layer.g_idx,
             self.use_shuffle,
             self.quant_config.weight_bits,
+            self.use_v2_format,
         )
         if bias is not None:
             output.add_(bias)

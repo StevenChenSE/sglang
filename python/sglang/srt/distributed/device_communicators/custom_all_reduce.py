@@ -381,7 +381,11 @@ class CustomAllreduce:
             if _RDNA_CUSTOM_AR:
                 # Standalone RDNA custom AR: PCIe peer access works via
                 # dedicated uncached buffers; no NVLink required for ws=2.
-                return inp_size <= self.max_size
+                # The one-shot kernel implements ONLY world_size==2: for a
+                # larger world with full_nvlink=False the HIP dispatch has no
+                # launch path, so admit nothing and let RCCL handle it
+                # (REVIEW 2026-09-10 C1).
+                return self.world_size == 2 and inp_size <= self.max_size
             if self.full_nvlink:
                 return inp_size <= self.max_size
             return False

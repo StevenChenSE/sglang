@@ -95,9 +95,11 @@ def gptq_gemm(
     b_g_idx: torch.Tensor,
     use_shuffle: bool,
     bit: int,
+    use_v2_format: bool = False,
 ) -> torch.Tensor:
     return torch.ops.sgl_kernel.gptq_gemm(
-        a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit
+        a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit,
+        use_v2_format,
     )
 
 

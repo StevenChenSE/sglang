@@ -752,8 +752,11 @@ class RMSNorm(BaseFusedOp):
                     residual_shape
                 )
             return output, residual_out
-        record(36, (x, output), (x.numel(),), name="rms_norm")
+        # Probe after output exists: on this residual-is-None path `output`
+        # is produced by rms_norm below, and referencing it earlier raised
+        # UnboundLocalError (REVIEW 2026-09-10 H3).
         output = rms_norm(x, self.weight.data, self.variance_epsilon)
+        record(36, (x, output), (x.numel(),), name="rms_norm")
         bisect_sync("rms_norm")
         if needs_reshape:
             output = output.reshape(original_shape)
