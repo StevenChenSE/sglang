@@ -154,10 +154,8 @@ DINLINE O downcast(array_t<float, O::size> val) {
 static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 #ifdef USE_MUSA
   volatile_store((uint32_t)flag, (uint32_t*)flag_addr);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-  asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
 #else
-  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+  __hip_atomic_store(flag_addr, flag, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 #endif
 }
 
@@ -168,21 +166,17 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
 #endif
 
   FlagType flag;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
-#else
-  asm volatile("ld.volatile.global.u32 %0, [%1]; membar.gl;" : "=r"(flag) : "l"(flag_addr));
-#endif
+  flag = __hip_atomic_load(flag_addr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
   return flag;
 }
 
 static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
-  asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+  __hip_atomic_store(flag_addr, flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
   FlagType flag;
-  asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
+  flag = __hip_atomic_load(flag_addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   return flag;
 }
 
@@ -610,7 +604,7 @@ class CustomAllreduce {
       void* base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
-      if (hipPointerGetAttribute(&base_ptr, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (hipDeviceptr_t)ptr) != hipSuccess)
+      if (hipPointerGetAttribute(&base_ptr, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR, (hipDeviceptr_t)ptr) != hipSuccess)
         throw std::runtime_error("failed to get pointer attr");
       CHECK_CUDA_SUCCESS(hipIpcGetMemHandle((hipIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);

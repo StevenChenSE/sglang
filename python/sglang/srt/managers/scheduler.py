@@ -5811,7 +5811,12 @@ def configure_scheduler_process(
 
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
-    faulthandler.enable()
+    # R2c fault context: all_threads=True so an aborting device fault (the
+    # HSA 0x1016 class fires c10::AcceleratorError -> abort) dumps every
+    # thread's stack, not just the aborting one's. SIGUSR2 additionally dumps
+    # all stacks on demand while the process is wedged but still alive.
+    faulthandler.enable(all_threads=True)
+    faulthandler.register(signal.SIGUSR2, all_threads=True)
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)

@@ -37,10 +37,28 @@ except ImportError as e:
 #  - peer data buffers must be dedicated hipExtMallocWithFlags(uncached)
 #    allocations: PCIe peer kernel reads only observe HBM, not the writer's
 #    L2 dirty lines, so torch caching-allocator segments read back zeros.
-_RDNA_CUSTOM_AR = os.environ.get("SGLANG_RDNA_CUSTOM_AR", "0") == "1"
+def _rdna_env_value(new_name: str, legacy_name: str) -> Optional[str]:
+    """Resolve an RDNA env var, honouring the legacy spelling.
+
+    The docs recommended SGL_RDNA_* before the names were corrected to
+    SGLANG_RDNA_* (round-2 review N3); accept the old spelling with a warning
+    so existing drop-ins don't silently disable the standalone all-reduce.
+    """
+    value = os.environ.get(new_name)
+    if value is None and (legacy := os.environ.get(legacy_name)) is not None:
+        logger.warning(
+            "Env var %s is deprecated; rename it to %s", legacy_name, new_name
+        )
+        value = legacy
+    return value
+
+
+_RDNA_CUSTOM_AR = (
+    _rdna_env_value("SGLANG_RDNA_CUSTOM_AR", "SGL_RDNA_CUSTOM_AR") or "0"
+) == "1"
 if _RDNA_CUSTOM_AR:
     try:
-        _rdna_ar_path = os.environ.get("SGLANG_RDNA_AR_PATH")
+        _rdna_ar_path = _rdna_env_value("SGLANG_RDNA_AR_PATH", "SGL_RDNA_AR_PATH")
         if not _rdna_ar_path or not os.path.isdir(_rdna_ar_path):
             _in_tree = os.path.abspath(
                 os.path.join(

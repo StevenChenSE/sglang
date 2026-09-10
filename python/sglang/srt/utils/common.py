@@ -1068,12 +1068,19 @@ def is_gfx942_supported():
 @lru_cache(maxsize=1)
 def is_rdna_supported():
     """
-    Returns whether the current platform is AMD RDNA (gfx10xx, gfx11xx, gfx12xx).
+    Returns whether the current platform is one of the RDNA targets this tree
+    actually builds code objects for — the RDNA_TARGETS list in
+    kernels/aot/setup_rocm.py (gfx1100/gfx1151/gfx1201). Accepting the whole
+    gfx10/11/12 families would let the RDNA-gated guards fire on parts (e.g.
+    RDNA2) that ship no such kernels (round-2 review H11).
     """
     if torch.version.hip and hasattr(torch, "cuda") and torch.cuda.is_available():
         try:
             gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-            return any(gfx in gcn_arch for gfx in ["gfx10", "gfx11", "gfx12"])
+            return any(
+                gcn_arch.startswith(gfx)
+                for gfx in ("gfx1100", "gfx1151", "gfx1201")
+            )
         except Exception:
             return False
     return False

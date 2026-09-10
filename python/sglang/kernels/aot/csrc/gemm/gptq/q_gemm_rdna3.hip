@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string_view>
 
 #include <torch/all.h>
 #include <c10/hip/HIPGuard.h>
@@ -767,8 +768,11 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
   // falls through the WMMA dispatch above on a non-gfx1100 device must
   // fail loudly instead.
   {
+    // No std::string here: this runs on every scalar-path GPTQ call
+    // (M=1..8, per layer, per decode step) and gcnArchName is a char[256]
+    // (round-2 review N8).
     const auto* dprops = at::cuda::getCurrentDeviceProperties();
-    const std::string device_arch = dprops->gcnArchName;
+    const std::string_view device_arch = dprops->gcnArchName;
     TORCH_CHECK(device_arch.rfind("gfx1100", 0) == 0,
                 "gptq_gemm_rdna3 scalar kernel body is only compiled for "
                 "gfx1100; current device is ", device_arch,

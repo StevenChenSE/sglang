@@ -38,7 +38,9 @@ _is_musa = is_musa()
 # RDNA3 standalone custom allreduce (see custom_all_reduce_ops.py). On this
 # stack peer kernel reads only observe HBM, so graph capture must use the
 # copy-in (unreg) path into the dedicated uncached shared buffer.
-_RDNA_CUSTOM_AR = os.environ.get("SGLANG_RDNA_CUSTOM_AR", "0") == "1"
+_RDNA_CUSTOM_AR = (
+    ops._rdna_env_value("SGLANG_RDNA_CUSTOM_AR", "SGL_RDNA_CUSTOM_AR") or "0"
+) == "1"
 
 logger = logging.getLogger(__name__)
 

@@ -231,6 +231,29 @@ def test_aot_compilation_units_are_accounted_for():
         ):
             # Some CUDA translation units are included by another source.
             continue
+        if source.suffix == ".hip":
+            # torch cpp_extension hipify on ROCm rewrites each manifest
+            # source into a generated .hip written next to it and compiles
+            # that instead: a .cu becomes a same-named .hip, a *_cuda.cu is
+            # renamed *_hip.hip, and even a .hip input is regenerated under a
+            # _hip suffix (e.g. topk.hip -> topk_hip.hip). The in-tree
+            # outputs are kept in sync with their sources, so a .hip that is
+            # the hipify image of a manifest unit is accounted.
+            stem = (
+                source.name[: -len("_hip.hip")]
+                if source.name.endswith("_hip.hip")
+                else source.stem
+            )
+            hipify_sources = {
+                source.parent / f"{stem}{suffix}"
+                for suffix in (".cu", ".hip", "_cuda.cu")
+            }
+            if any(
+                path.relative_to(AOT_ROOT).as_posix() in manifest_text
+                for path in hipify_sources
+                if path.exists()
+            ):
+                continue
         missing.append(relative_path)
     assert not missing, f"AOT compilation units missing from build manifests: {missing}"
 

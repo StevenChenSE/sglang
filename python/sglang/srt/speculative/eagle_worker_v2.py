@@ -167,8 +167,13 @@ def _vocab_parallel_top1(logits: torch.Tensor):
     if tp_size == 1:
         return torch.ones_like(local_idx, dtype=torch.float32), local_idx
     local_size = logits.shape[-1]
+    # Offsets use the group-local rank: vocab shards are laid out by
+    # rank_in_group (same convention as get_attn_tensor_model_parallel_rank),
+    # not the global rank — with attn-TP groups [0,1]/[2,3] the global rank of
+    # a group member is not its shard index (round-2 review N1).
     packed = torch.cat(
-        [local_val, (local_idx + tp.rank * local_size).to(torch.float32)], dim=-1
+        [local_val, (local_idx + tp.rank_in_group * local_size).to(torch.float32)],
+        dim=-1,
     )
     gathered = tp.all_gather(packed, dim=0).view(tp_size, *local_idx.shape, 2)
     # [tp_size, batch, 1] per element. nan_to_num keeps NaN shards from

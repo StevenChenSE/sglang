@@ -829,7 +829,10 @@ def run_data_parallel_controller_process(
     run_scheduler_process_func: Callable = run_scheduler_process,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
-    faulthandler.enable()
+    # Match the scheduler's fault-context setup (R2c): all-thread dumps on
+    # abort, plus an on-demand SIGUSR2 dump while the process is alive.
+    faulthandler.enable(all_threads=True)
+    faulthandler.register(signal.SIGUSR2, all_threads=True)
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 

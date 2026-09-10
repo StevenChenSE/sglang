@@ -281,6 +281,9 @@ jobs:
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_kvcacheio.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
+          # RDNA3-only numeric smoke; self-skips on MI runners, runs wherever a
+          # gfx1100 device is attached (round-2 review N4).
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_gptq_rdna3_smoke.py
           exit $failures
 
   sgl-kernel-unit-test-2-gpu-amd:

@@ -77,14 +77,19 @@ class GPTQLinearScheme(GPTQLinearSchemeBase):
                 # The RDNA3 GPTQ kernel only implements the shuffled standard
                 # layout; desc_act + row-parallel used to set use_shuffle=False
                 # here and then die on a TORCH_CHECK at the first forward
-                # (REVIEW 2026-09-10 H14). Fail here with an actionable
-                # message instead.
-                raise ValueError(
-                    "Plain GPTQ with desc_act=True is not supported with "
-                    "tensor parallelism > 1 on RDNA3 (the non-shuffled "
-                    "act-order layout is not implemented). Use TP=1 or a "
-                    "non-desc_act checkpoint."
-                )
+                # (REVIEW 2026-09-10 H14). Other HIP targets keep that legacy
+                # unshuffled path (round-2 review N2), so the raise is scoped
+                # to RDNA.
+                from sglang.srt.utils.common import is_rdna_supported
+
+                if is_rdna_supported():
+                    raise ValueError(
+                        "Plain GPTQ with desc_act=True is not supported with "
+                        "tensor parallelism > 1 on RDNA3 (the non-shuffled "
+                        "act-order layout is not implemented). Use TP=1 or a "
+                        "non-desc_act checkpoint."
+                    )
+                self.kernel.use_shuffle = False
             scale_and_zero_size = input_size_per_partition // group_size
             scale_and_zero_input_dim = 0
 

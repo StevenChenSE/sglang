@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 class HybridAttnBackend(AttentionBackend):
     """Support different backends for prefill and decode."""
 
-    def __init__( 
+    def __init__(
         self,
         model_runner: ModelRunner,
         prefill_backend: AttentionBackend,
