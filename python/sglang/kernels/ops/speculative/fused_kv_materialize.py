@@ -254,6 +254,7 @@ class FusedKVMaterializeHelper:
         head_dim: int,
         device: torch.device,
         max_position_hint: Optional[int] = None,
+        kv_weights_override: Optional[List[torch.Tensor]] = None,
     ):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -319,8 +320,24 @@ class FusedKVMaterializeHelper:
                     f"got (rotary_dim={layer_rotary_dim}, neox={layer_is_neox}) at layer {layer_id}."
                 )
 
-            qkv_w = attn.qkv_proj.weight
-            kv_weight = qkv_w[attn.q_size : attn.q_size + 2 * attn.kv_size]
+            if kv_weights_override is not None:
+                # Caller already materialized dense K/V rows (e.g. dequantized
+                # from a packed quantized qkv_proj); validate the layout only.
+                kv_weight = kv_weights_override[layer_id]
+                if (
+                    not isinstance(kv_weight, torch.Tensor)
+                    or kv_weight.dim() != 2
+                    or kv_weight.shape[0] != 2 * attn.kv_size
+                ):
+                    raise ValueError(
+                        "kv_weights_override entry has invalid shape for fused "
+                        f"KV path: expected 2D [2*{attn.kv_size}, in_features], "
+                        f"got {tuple(kv_weight.shape) if isinstance(kv_weight, torch.Tensor) else type(kv_weight)} "
+                        f"at layer {layer_id}."
+                    )
+            else:
+                qkv_w = attn.qkv_proj.weight
+                kv_weight = qkv_w[attn.q_size : attn.q_size + 2 * attn.kv_size]
             kv_weights.append(kv_weight)
             k_norm_weights.append(attn.k_norm.weight)
             eps_values.append(float(attn.k_norm.variance_epsilon))

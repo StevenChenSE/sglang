@@ -749,6 +749,66 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
+def can_dflash_dequant_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
+    """Validate whether a quantized qkv_proj can feed the fused KV path via
+    one-hot dequantization. Requires the RDNA3 GPTQ packed layout produced by
+    process_weights_after_loading (weight_packed [K/8, N] + scales + zeros +
+    g_idx) and no bias."""
+    for name in ("weight_packed", "weight_scale", "weight_shape", "weight_g_idx"):
+        if getattr(qkv_proj, name, None) is None:
+            return (
+                False,
+                f"quantized qkv_proj lacks {name} "
+                f"(quant_method={type(getattr(qkv_proj, 'quant_method', None)).__name__})",
+            )
+    if getattr(qkv_proj, "bias", None) is not None:
+        return False, "qkv bias is not supported for fused KV path"
+    return True, ""
+
+
+def dequantize_gptq_kv_rows(
+    qkv_proj: Any,
+    q_size: int,
+    kv_size: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Recover dense [2*kv_size, in_features] K/V rows from a packed RDNA3 GPTQ
+    qkv_proj.
+
+    The packed layout stores W as [K/8, N] exllama-shuffled nibbles, which the
+    kernel multiplies as a @ dequant(W).T. Feeding it a one-hot activation
+    returns the dense dequantized [K, N] matrix directly, sidestepping any need
+    to invert the nibble shuffle in Python.
+    """
+    from sgl_kernel import gptq_gemm
+
+    w_q = qkv_proj.weight_packed
+    w_zp = qkv_proj.weight_zero_point
+    w_s = qkv_proj.weight_scale
+    g_idx = qkv_proj.weight_g_idx
+    in_features = int(qkv_proj.weight_shape[1])
+    out_features = int(w_q.shape[1])
+    if out_features != q_size + 2 * kv_size:
+        raise ValueError(
+            "qkv packed weight width mismatch: expected "
+            f"{q_size + 2 * kv_size} columns (q_size={q_size}, kv_size={kv_size}), "
+            f"got {out_features}."
+        )
+    # One int32 holds 32/num_bits nibbles; derive num_bits from the packing
+    # ratio instead of plumbing the scheme through.
+    num_bits = int(round(w_q.numel() * 32 / (in_features * out_features)))
+    if in_features != int(w_q.shape[0]) * (32 // num_bits):
+        raise ValueError(
+            "qkv packed weight shape is inconsistent with weight_shape: "
+            f"packed {tuple(w_q.shape)}, logical in_features={in_features}, "
+            f"derived num_bits={num_bits}."
+        )
+    eye = torch.eye(in_features, dtype=out_dtype, device=w_q.device)
+    dense = gptq_gemm(eye, w_q, w_zp, w_s, g_idx, True, num_bits)
+    kv = dense[:, q_size : q_size + 2 * kv_size]
+    return kv.transpose(0, 1).contiguous()
+
+
 @triton.jit
 def _fused_correct_drafts_and_bonus_kernel(
     candidates_ptr,

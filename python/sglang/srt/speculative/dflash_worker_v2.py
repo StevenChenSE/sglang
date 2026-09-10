@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
@@ -53,12 +54,15 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
+    can_dflash_dequant_fused_qkv_proj,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    dequantize_gptq_kv_rows,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    UnquantizedLinearMethod,
 )
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -410,7 +414,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda() or is_hip()
+        self._use_fused_kv_materialize = (is_cuda() or is_hip()) and os.environ.get(
+            "SGLANG_DFLASH2_DISABLE_FUSED_KV", "0"
+        ) != "1"
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -708,9 +714,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._fused_kv_helper = None
                 return
 
+            quantized_qkv = False
             for layer_idx, layer in enumerate(layers):
                 attn = layer.self_attn
-                eligible, reason = can_dflash_use_fused_qkv_proj(attn.qkv_proj)
+                quant_method = getattr(attn.qkv_proj, "quant_method", None)
+                if isinstance(quant_method, UnquantizedLinearMethod):
+                    eligible, reason = can_dflash_use_fused_qkv_proj(attn.qkv_proj)
+                else:
+                    quantized_qkv = True
+                    eligible, reason = can_dflash_dequant_fused_qkv_proj(attn.qkv_proj)
                 if not eligible:
                     fused_disable_reason = f"{reason}: layer={layer_idx}"
                     break
@@ -755,6 +767,35 @@ class DFlashWorkerV2(BaseSpecWorker):
             first_attn = layers[0].self_attn
             rotary_emb = first_attn.rotary_emb
 
+            kv_weight_override: Optional[List[torch.Tensor]] = None
+            if quantized_qkv:
+                # Dense K/V rows cannot be sliced from packed weights; recover
+                # them once via the GPTQ kernel and hand them to the helper.
+                kv_weight_override = []
+                for layer_idx, layer in enumerate(layers):
+                    attn = layer.self_attn
+                    if isinstance(
+                        getattr(attn.qkv_proj, "quant_method", None),
+                        UnquantizedLinearMethod,
+                    ):
+                        kv_weight_override.append(
+                            attn.qkv_proj.weight[
+                                attn.q_size : attn.q_size + 2 * attn.kv_size
+                            ]
+                        )
+                    else:
+                        kv_weight_override.append(
+                            dequantize_gptq_kv_rows(
+                                attn.qkv_proj, attn.q_size, attn.kv_size
+                            )
+                        )
+                if self.ps.tp_rank == 0:
+                    logger.info(
+                        "DFLASH fused KV: recovered dense K/V rows from packed "
+                        "quantized qkv weights (one-hot GPTQ dequant, %d layers).",
+                        len(kv_weight_override),
+                    )
+
             self._fused_kv_helper = FusedKVMaterializeHelper(
                 layers=layers,
                 rotary_emb=rotary_emb,
@@ -763,6 +804,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=self.device,
                 max_position_hint=self.target_worker.model_runner.model_config.context_len
                 + int(self.block_size),
+                kv_weights_override=kv_weight_override,
             )
             if self.ps.tp_rank == 0:
                 logger.info(
