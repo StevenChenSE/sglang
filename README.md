@@ -183,7 +183,7 @@ python -m sglang.launch_server \
 Key DFlash2 differences vs the MTP-3 recipe above:
 
 - Draft model is the separate **Qwen3.8-27B-DFlash2** checkpoint (5-layer
-  drafter, `incoai/Qwen3.8-27B-DFlash2` on HF Hub), loaded unquantized via
+  drafter, [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) on HF Hub), loaded unquantized via
   `--speculative-draft-model-quantization unquant` so it does not inherit the
   target model's W4A16 quantization config.
 - `--speculative-num-draft-tokens 8` (7-token draft block + 1) with a
@@ -196,8 +196,9 @@ Measured on this fork (2026-09-09, 2x RX 7900 XTX TP=2): math CoT TG ~166 tok/s
 (GSM8K/MATH-500), 120k agentic replay mean TG ~84 tok/s, and ~97% TG retention
 at 16k context depth (two-run averages).
 
-**W4A16 draft variant (2026-09-10):** `syvai/Qwen3.8-27B-DFlash2-W4A16` ships
-the drafter pre-quantized with the same compressed-tensors W4A16 scheme as the
+**W4A16 draft variant (2026-09-10):**
+[`syvai/Qwen3.8-27B-DFlash2-W4A16`](https://huggingface.co/syvai/Qwen3.8-27B-DFlash2-W4A16)
+ships the drafter pre-quantized with the same compressed-tensors W4A16 scheme as the
 target — point `SGLANG_DFLASH2_PATH` at it and clear
 `SGLANG_DFLASH2_QUANT` (empty) so the checkpoint's own quant config applies
 instead of the `unquant` default. The drafter drops from 2.09 to **1.04
