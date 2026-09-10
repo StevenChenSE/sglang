@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -19,6 +21,8 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_sort_g_idx,
     marlin_zero_points,
 )
+
+logger = logging.getLogger(__name__)
 from sglang.srt.layers.quantization.utils import (
     get_scalar_types,
     replace_parameter,
@@ -96,6 +100,9 @@ class GPTQLinearKernel:
         # used to be computed in the scheme and dropped here, so v2 weights
         # dequantized with zero+1 (REVIEW 2026-09-10 H1).
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
+        # Set in process_weights_after_loading once the on-device scale dtype
+        # is known.
+        self.fp16_compute = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # for torch.compile
@@ -115,6 +122,34 @@ class GPTQLinearKernel:
                 )
             gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
 
+        # E1 (efficiency review 2026-09-11): on RDNA3 the bf16 scalar GPTQ
+        # inner loop is scalar-FMA bound (gfx11 has no v_pk_fma_bf16) and
+        # measures 1.2-1.9x slower than the fp16 v_dot2 path at identical
+        # shapes, while plain-GPTQ checkpoints store scales natively as F16.
+        # When the serving dtype is bf16, keep fp16 scales and compute the
+        # GEMM through the fp16 path: activations are cast bf16->fp16 per
+        # call (post-norm hidden states are unit-scale, well inside fp16
+        # range) and the output is cast back; accumulation stays fp32 inside
+        # the kernel, so the only new rounding is the finer-mantissa input
+        # cast. SGLANG_RDNA_FP16_GPTQ=0 disables.
+        from sglang.srt.utils.common import is_rdna_supported
+
+        self.fp16_compute = (
+            os.environ.get("SGLANG_RDNA_FP16_GPTQ", "1") == "1"
+            and is_rdna_supported()
+            and layer.scales.dtype == torch.bfloat16
+        )
+        if self.fp16_compute:
+            layer.scales = torch.nn.Parameter(
+                layer.scales.data.to(torch.float16), requires_grad=False
+            )
+            if not getattr(self.__class__, "_fp16_compute_logged", False):
+                self.__class__._fp16_compute_logged = True
+                logger.info(
+                    "RDNA3 fp16 GPTQ compute enabled (E1): fp16 scales, "
+                    "bf16 activations cast per call, output cast back."
+                )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -124,16 +159,29 @@ class GPTQLinearKernel:
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
 
-        output = gptq_gemm(
-            reshaped_x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            layer.g_idx,
-            self.use_shuffle,
-            self.quant_config.weight_bits,
-            self.use_v2_format,
-        )
+        if self.fp16_compute:
+            output = gptq_gemm(
+                reshaped_x.to(torch.float16),
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                layer.g_idx,
+                self.use_shuffle,
+                self.quant_config.weight_bits,
+                self.use_v2_format,
+            )
+            output = output.to(x.dtype)
+        else:
+            output = gptq_gemm(
+                reshaped_x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                layer.g_idx,
+                self.use_shuffle,
+                self.quant_config.weight_bits,
+                self.use_v2_format,
+            )
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
