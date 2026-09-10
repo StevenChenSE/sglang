@@ -209,6 +209,18 @@ are dequantized from their packed checkpoint triples at load time, and the
 fused context-KV path now dequantizes packed draft qkv rows via a one-hot
 GPTQ GEMM (measured in §5 below).
 
+**Greedy-mode fidelity caveat (2026-09-10):** at `temperature: 0`, block
+batched verify is not bit-equivalent to sequential decode — roughly a
+quarter of accept boundaries sit at a sub-0.5-logit top-2 margin, where the
+M=8 verify batch's numerics can land on the other token. Committed flips are
+fluent individually but re-route the chain, and long greedy generations can
+drift into degraded structure (mangled tables, duplicated list items). The
+accept/commit path itself is exact (per-step invariant audit, zero
+violations; see `DFLASH-OUTPUT-CORRUPTION-JOURNAL.md`). MTP-3 shares the
+mechanism at smaller amplitude. For quality-critical greedy workloads prefer
+the MTP recipe (`qwen38-autoround-mtp`) or disable spec decode
+(`SGLANG_NO_SPEC=1`); at `temperature > 0` DFlash2 is unaffected.
+
 ---
 
 ## Empirical Benchmarks

@@ -203,6 +203,14 @@ bf16 持平（单并发 3.30–3.34，c=4 时 3.27）。为此需要两处加载
 融合上下文 KV 路径通过 one-hot GPTQ GEMM 从 packed qkv 权重还原稠密 K/V 行
 （实测见下方第 5 节）。
 
+**Greedy（temperature: 0）保真度提示（2026-09-10）：**分块批量验证与逐 token 解码并非
+逐位等价——约四分之一的接受边界其 top-2 logit 间距不足 0.5，此时 M=8 验证批的数值误差
+足以让 argmax 落到另一个 token 上。单次翻转虽然流畅，但会使生成链改道；较长的 greedy
+生成可能逐渐漂移出退化结构（表格错乱、列表项重复）。接受/提交路径本身已被逐轮不变量
+审计证明精确（零违例，详见 `DFLASH-OUTPUT-CORRUPTION-JOURNAL.md`）；MTP-3 存在同一机制
+但幅度更小。对质量敏感的 greedy 场景建议改用 MTP 配方（`qwen38-autoround-mtp`）或关闭
+投机解码（`SGLANG_NO_SPEC=1`）；`temperature > 0` 时 DFlash2 不受影响。
+
 ---
 
 ## 实测性能基准对比

@@ -64,6 +64,11 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
     UnquantizedLinearMethod,
 )
+
+# Output-corruption audit (see DFLASH-OUTPUT-CORRUPTION-JOURNAL.md): per-round
+# accept invariant trace, gated and off by default.
+_DFLASH_DEBUG_ACCEPT = os.environ.get("SGLANG_DFLASH_DEBUG_ACCEPT", "0") == "1"
+_DFLASH_DEBUG_ROUND = [0]
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -2398,6 +2403,120 @@ class DFlashWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             bs=bs,
         )
+
+        if _DFLASH_DEBUG_ACCEPT and target_predict is not None and bs == 1:
+            # Within-round invariant audit: accepted chain must equal the
+            # target argmax chain, and the triton path must match an eager
+            # recompute. Divergence of final text from plain greedy while
+            # this invariant holds means the verify *context* (KV) is
+            # corrupted across rounds, not the accept comparison.
+            tp = target_predict[0]
+            match = candidates[0, 1:] == tp[: block_size - 1]
+            if bool(match.all()):
+                eager_accept = int(match.sum().item())
+            else:
+                eager_accept = int((~match).to(torch.int32).argmax().item())
+            logger.info(
+                "DFLASH_ACCEPT_DEBUG r=%d prefix=%d accept=%d eager_accept=%d "
+                "cand=%s tgt=%s out=%s bonus=%d commit=%d",
+                _DFLASH_DEBUG_ROUND[0],
+                int(prefix_lens[0].item()),
+                int(accept_len[0].item()),
+                eager_accept,
+                candidates[0].tolist(),
+                tp.tolist(),
+                out_tokens[0].tolist(),
+                int(bonus[0].item()),
+                int(commit_lens[0].item()),
+            )
+            _DFLASH_DEBUG_ROUND[0] += 1
+            mismatch = (
+                out_tokens[0, : commit_lens[0]] !=
+                torch.cat(
+                    [
+                        candidates[0, 1 : 1 + int(accept_len[0].item())],
+                        bonus[0:1],
+                    ]
+                )
+            ).any().item()
+            if int(accept_len[0].item()) != eager_accept or mismatch:
+                logger.warning(
+                    "DFLASH_ACCEPT_DEBUG INVARIANT VIOLATION: triton accept "
+                    "path disagrees with eager recompute (accept=%d vs %d, "
+                    "mismatch=%d)",
+                    int(accept_len[0].item()),
+                    eager_accept,
+                    int(mismatch),
+                )
+
+            # Determinism probe: re-run the identical verify forward. Bitwise
+            # identical logits => corruption comes from the inputs; differing
+            # logits => either the forward mutates persistent state or the
+            # numerics jitter (near-tie argmax flips). The maxdiff MAGNITUDE
+            # and the per-step match pattern discriminate the two.
+            try:
+                # VRAM on this box is essentially full after load: keep probe
+                # allocations to a single bf16 logits clone (~2.4 MB); all
+                # comparisons downconvert scalars only.
+                logits1 = (
+                    logits_output.next_token_logits.view(
+                        1, int(self.block_size), -1
+                    )[0]
+                    .clone()
+                )
+                mamba_cache = (
+                    self.target_worker.model_runner.req_to_token_pool.mamba_pool.mamba_cache
+                )
+                pool_before = float(
+                    mamba_cache.temporal.sum(dtype=torch.float32).item()
+                )
+                conv_before = float(
+                    sum(c.sum(dtype=torch.float32).item() for c in mamba_cache.conv)
+                )
+                target_out2 = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=verify_forward_batch,
+                    is_verify=True,
+                )
+                logits2 = target_out2.logits_output.next_token_logits.view(
+                    1, int(self.block_size), -1
+                )[0]
+                pool_after = float(
+                    mamba_cache.temporal.sum(dtype=torch.float32).item()
+                )
+                conv_after = float(
+                    sum(c.sum(dtype=torch.float32).item() for c in mamba_cache.conv)
+                )
+                tp2 = torch.argmax(logits2, dim=-1)
+                match8 = (tp2 == tp).tolist()
+                maxdiff = float((logits2 - logits1).abs().max().item())
+                # Per-step top-2 gap in forward 1 (tie-prone steps have ~0 gap)
+                # and the margin by which forward-1's choice beat forward-2's
+                # at each flipped step (negative => forward 2 flipped it).
+                l1f = logits1.float()
+                top2 = torch.topk(l1f, 2, dim=-1)
+                gaps = [round(float(g), 4) for g in (top2.values[:, 0] - top2.values[:, 1]).tolist()]
+                margins = []
+                for j in range(int(self.block_size)):
+                    if not bool(match8[j]):
+                        margins.append(
+                            round(
+                                float(l1f[j, int(tp[j])] - l1f[j, int(tp2[j])]),
+                                4,
+                            )
+                        )
+                logger.info(
+                    "DFLASH_ACCEPT_DEBUG reforward match8=%s maxdiff=%.4g "
+                    "gaps=%s flipped_margins=%s pool_d=%+.4g conv_d=%+.4g",
+                    match8,
+                    maxdiff,
+                    gaps,
+                    margins,
+                    pool_after - pool_before,
+                    conv_after - conv_before,
+                )
+            except Exception as e:
+                logger.warning("DFLASH_ACCEPT_DEBUG reforward failed: %s", e)
 
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
