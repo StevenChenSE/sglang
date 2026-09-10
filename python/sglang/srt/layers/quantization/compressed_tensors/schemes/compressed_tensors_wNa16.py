@@ -48,6 +48,23 @@ _has_marlin_repack = is_cuda() or is_hip()
 if _has_marlin_repack:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
+# RDNA3 (gfx1100) has no marlin kernel build; the compressed-tensors W4A16
+# path repacks into the exllama/GPTQ layout served by the sgl_kernel GPTQ
+# GEMM instead — the kernel family the GPTQ quantization scheme already
+# runs on this hardware.
+_is_rdna3 = False
+if is_hip():
+    try:
+        from sglang.srt.utils.common import is_rdna_supported
+
+        _is_rdna3 = is_rdna_supported()
+    except Exception:
+        _is_rdna3 = False
+
+if _is_rdna3:
+    from sgl_kernel import gptq_gemm as _rdna3_gptq_gemm
+    from sgl_kernel import gptq_shuffle as _rdna3_gptq_shuffle
+
 
 ScalarType, scalar_types = get_scalar_types()
 
@@ -121,8 +138,14 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         # If group_size is -1, we are in channelwise case.
         group_size = self.group_size if self.group_size != -1 else input_size
         row_parallel = (input_size != input_size_per_partition)
-        partition_scales = not marlin_repeat_scales_on_all_ranks(
-            self.has_g_idx, self.group_size, row_parallel)
+        # RDNA3 consumes the GPTQ kernel layout, which indexes scales and
+        # zero points per rank; partition them like the GPTQ scheme instead
+        # of repeating full-K scales on every rank (the marlin convention).
+        partition_scales = (
+            not marlin_repeat_scales_on_all_ranks(
+                self.has_g_idx, self.group_size, row_parallel)
+            or _is_rdna3
+        )
 
         scales_and_zp_size = input_size // group_size
 
@@ -220,6 +243,10 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
+        if _is_rdna3:
+            self._process_weights_after_loading_rdna3(layer)
+            return
+
         check_marlin_supports_shape(
             c.partition_weight_shape[1],  # out_features
             c.partition_weight_shape[0],  # in_features
@@ -303,6 +330,59 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         _transform_param(layer, self.w_q_name, transform_w_q)
         _transform_param(layer, self.w_s_name, transform_w_s)
 
+    def _process_weights_after_loading_rdna3(self, layer: torch.nn.Module) -> None:
+        """gfx1100: repack compressed-tensors tensors for sgl_kernel.gptq_gemm.
+
+        Mirrors vLLM's RDNA3W4A16LinearKernel: permute the pack-quantized
+        tensors to the [K/8, N] exllama layout, synthesize zero points for
+        symmetric checkpoints, and nibble-shuffle the packed weights.
+        """
+        c = self.kernel_config
+        device = getattr(layer, self.w_q_name).device
+
+        if c.has_g_idx:
+            g_idx = torch.argsort(getattr(layer, self.w_gidx_name).data).to(torch.int)
+            replace_parameter(layer, self.w_gidx_name, g_idx)
+        else:
+            g_idx = torch.empty((0,), dtype=torch.int, device=device)
+            setattr(layer, self.w_gidx_name,
+                    torch.nn.Parameter(g_idx, requires_grad=False))
+
+        if c.zero_points:
+            zp = getattr(layer, self.w_zp_name)
+            permute_param_layout_(zp, input_dim=0, output_dim=1, packed_dim=1)
+            replace_parameter(layer, self.w_zp_name, zp.data.contiguous())
+        else:
+            # Symmetric checkpoints carry no zero points. The kernel reads
+            # zero+1 (GPTQv1 quirk), so the neutral fill for uint4b8's +8
+            # bias is 7: dequant(code) = scale * (code - 8).
+            fill = 0
+            for i in range(self.pack_factor):
+                fill |= (c.weight_type.bias - 1) << (4 * i)
+            groups = c.partition_weight_shape[0] // c.group_size
+            out_features = c.partition_weight_shape[1]
+            zeros = torch.full(
+                (groups, out_features // self.pack_factor),
+                fill,
+                dtype=torch.int32,
+                device=device,
+            )
+            setattr(layer, self.w_zp_name,
+                    torch.nn.Parameter(zeros, requires_grad=False))
+
+        # [out, K/8] packed along K -> [K/8, out], then the exllama nibble
+        # shuffle (empty g_idx => identity permutation).
+        w_q = getattr(layer, self.w_q_name)
+        permute_param_layout_(w_q, input_dim=0, output_dim=1, packed_dim=0)
+        w_q = w_q.data.contiguous()
+        _rdna3_gptq_shuffle(w_q, g_idx, c.weight_type.size_bits)
+        replace_parameter(layer, self.w_q_name, w_q)
+
+        # [out, groups] -> [groups, out]
+        w_s = getattr(layer, self.w_s_name)
+        permute_param_layout_(w_s, input_dim=0, output_dim=1)
+        replace_parameter(layer, self.w_s_name, w_s.data.contiguous())
+
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
         c = self.kernel_config
@@ -323,6 +403,22 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
 
         w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
+
+        if _is_rdna3:
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
+            output = _rdna3_gptq_gemm(
+                x_2d,
+                w_q,
+                w_zp,
+                w_s,
+                w_gidx,
+                True,  # use_shuffle: weights are pre-shuffled (exllama layout)
+                c.weight_type.size_bits,
+            )
+            if bias is not None:
+                output = output + bias
+            return output.reshape(out_shape)
 
         # `process_weights_after_loading` will ensure w_zp and w_gidx are not
         #  None for marlin
