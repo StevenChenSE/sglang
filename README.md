@@ -196,6 +196,18 @@ Measured on this fork (2026-09-09, 2x RX 7900 XTX TP=2): math CoT TG ~166 tok/s
 (GSM8K/MATH-500), 120k agentic replay mean TG ~84 tok/s, and ~97% TG retention
 at 16k context depth (two-run averages).
 
+**W4A16 draft variant (2026-09-10):** `syvai/Qwen3.8-27B-DFlash2-W4A16` ships
+the drafter pre-quantized with the same compressed-tensors W4A16 scheme as the
+target — point `SGLANG_DFLASH2_PATH` at it and clear
+`SGLANG_DFLASH2_QUANT` (empty) so the checkpoint's own quant config applies
+instead of the `unquant` default. The drafter drops from 2.09 to **1.04
+GiB/GPU** and the KV pool grows from 189,172 to **217,746 tokens** (+15.1%) at
+bf16-parity accept length (3.30–3.34 solo, 3.27 @ c=4). Two loader changes
+make this work: plain drafter params (`fc` + ignore-listed projections)
+are dequantized from their packed checkpoint triples at load time, and the
+fused context-KV path now dequantizes packed draft qkv rows via a one-hot
+GPTQ GEMM (measured in §5 below).
+
 ---
 
 ## Empirical Benchmarks
@@ -205,6 +217,8 @@ SGLang columns refreshed 2026-09-09 on the current merged/rebuilt build
 (`llama-benchy` 0.4.0); depth-profile and 120k numbers are two-run averages,
 DFlash2 math and c=4 are single runs. vLLM baseline columns are from earlier
 runs and should be re-benched under the same tool version for exact deltas.
+The DFlash2 columns above are the bf16 drafter; §5 re-benchmarks the DFlash2
+configuration with the W4A16 drafter (2026-09-10, fused KV materialization).
 
 ### 1. Standardized Context Depth Profile (`llama-benchy`)
 *Standard prompt prefill ($PP=2048$) and token generation ($TG=128$), concurrency = 1*
@@ -267,6 +281,44 @@ runs and should be re-benched under the same tool version for exact deltas.
 | **llama.cpp (MTP)** | c = 4 | 636.3 tok/s | 50.1 tok/s | — | Bottlenecked by slot queuing (`-np 2`) |
 
 > **Key Concurrency Takeaway**: Both SGLang spec engines stay **100% stable under 4 concurrent streams** on RDNA3 — no `hipErrorIllegalAddress`, no graph-capture failures (vLLM's native MTP-3 still crashes at batch > 1). DFlash2 leads the c = 4 field at **92.1 tok/s aggregate** (+10.8% vs the vLLM no-spec baseline, +21.3% vs vLLM DFlash2) with a **146 tok/s peak**; MTP-3 lands at 78.5 tok/s. The vLLM columns predate `llama-benchy` 0.4.0, so re-bench the baselines under 0.4.0 before quoting exact cross-engine deltas.
+
+### 5. W4A16 Draft Model (`syvai/Qwen3.8-27B-DFlash2-W4A16`, fused KV)
+*2026-09-10, same hardware and `llama-benchy` 0.4.0. Depth-profile and 120k
+numbers were measured on an isolated port with no other traffic; math, c=4,
+deep-context and multimodal are from the 2026-09-09 suite on the sequential
+KV path (accuracy is path-independent, and fused KV only changes the draft
+context-KV build).*
+
+**Depth profile** (PP=2048/TG=128, c=1; two-run averages, 16k is a three-sample mean):
+
+| Metric | bf16 drafter (§1) | W4A16 drafter (fused KV) |
+|:---|:---:|:---:|
+| **Depth 0** | 107.9 tok/s | 118.9 tok/s |
+| **Depth 4,096** | 96.8 tok/s | 98.9 tok/s |
+| **Depth 8,192** | 97.7 tok/s | 95.9 tok/s |
+| **Depth 16,384** | 105.1 tok/s | 98.0 tok/s |
+| **Retention (16k / 0k)** | 97.4% | 82.4% |
+
+> Run-to-run TG on this box swings ±15 tok/s (back-to-back depth-0 samples read 101.7 and 136.1), so read single depths at that resolution. With fused KV disabled at the same isolated port the 16k mean drops to 88.1 tok/s — fused KV is worth ~+11% at depth and recovers most of the 16k-retention gap to the bf16 drafter.
+
+**120k agentic replay** (two runs, fused KV): mean **88.6 tok/s**, median
+**82.8 tok/s**, CV **25.3%**, worst turn **52.5 tok/s** — vs 83.8 / 79.8 /
+23.0% / 40.6 for the bf16 drafter. Mean TG holds at parity or slightly better.
+
+**Math CoT** (greedy, single run): 3/4 correct — the *same* GSM8K #1 slip as
+the bf16 drafter (answered 96, gold 72), so quantizing the drafter costs no
+additional accuracy. Average TG **148.9 tok/s** (the 63-token GSM8K #1 answer
+skews low at 54.0 tok/s; the three longer answers run 155–200 tok/s).
+
+**Deep-context scaling** (single run, 10k→160k TG): 78.4 / 117.3 / 90.4 /
+86.1 / 60.1 / 39.0 tok/s — TG decays past ~80k, consistent with the
+long-context behavior of this windowed drafter family.
+
+**c=4 concurrency:** total TG **89.3 tok/s**, peak **121 tok/s**, PP
+**1,266 tok/s**, 100% stable (bf16 drafter: 92.1 / 146.0 / 1,275.5).
+
+**Multimodal matrix:** zero loop/format defects across single/multi-image and
+interleaved agent-turn workloads.
 
 ---
 
