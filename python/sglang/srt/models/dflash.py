@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -83,6 +83,81 @@ def _logical_linear_weight_shape(
     if logical_numel % output_features == 0:
         return (output_features, logical_numel // output_features)
     return (logical_numel,)
+
+
+def _dequantize_packed_for_plain_params(
+    weights: List[Tuple[str, torch.Tensor]],
+    params_dict: Dict[str, torch.nn.Parameter],
+) -> List[Tuple[str, torch.Tensor]]:
+    """Dequantize *.weight_packed/_scale/_shape triples aimed at plain params.
+
+    llm-compressor quantizes every linear absent from the checkpoint's ignore
+    list, but the model may build some of those modules (e.g. this draft's
+    fc) as plain bf16 nn.Linear. Their packed tensors resolve to no param and
+    would be silently skipped below, leaving random init in the layer; fold
+    them back to a dense weight instead. Handles compressed-tensors W4A16
+    pack-quantized symmetric (uint4 codes biased by +8, group-wise scales).
+    """
+    pending: Dict[str, Dict[str, torch.Tensor]] = {}
+    out: List[Tuple[str, torch.Tensor]] = []
+    for name, loaded_weight in weights:
+        matched = False
+        for suffix in ("_packed", "_scale", "_shape"):
+            if not name.endswith(suffix) or name in params_dict:
+                continue
+            base = name[: -len(suffix)]
+            if base not in params_dict:
+                candidate = (
+                    base[len("model."):]
+                    if base.startswith("model.")
+                    else f"model.{base}"
+                )
+                if candidate in params_dict:
+                    base = candidate
+                else:
+                    continue
+            param = params_dict[base]
+            if getattr(param, "pack_factor", None) is not None:
+                # Quantized module owns its packed param; load it as-is.
+                continue
+            pending.setdefault(base, {})[suffix[1:]] = loaded_weight
+            matched = True
+            break
+        if not matched:
+            out.append((name, loaded_weight))
+
+    for base, parts in pending.items():
+        if not {"packed", "scale", "shape"} <= parts.keys():
+            raise ValueError(
+                f"DFLASH draft: incomplete packed weight tensors for plain "
+                f"param '{base}': found {sorted(parts.keys())}"
+            )
+        param = params_dict[base]
+        packed = parts["packed"].long()
+        scale = parts["scale"].float()
+        shape = parts["shape"].long()
+        out_features, packed_cols = packed.shape
+        in_features = int(shape[1])
+        if out_features * packed_cols * 8 != out_features * in_features:
+            raise ValueError(
+                f"DFLASH draft: packed weight shape {tuple(packed.shape)} "
+                f"inconsistent with logical shape {tuple(shape.tolist())} "
+                f"for plain param '{base}'"
+            )
+        num_groups = scale.shape[1]
+        if num_groups * (in_features // num_groups) != in_features:
+            raise ValueError(
+                f"DFLASH draft: scale groups {num_groups} do not divide "
+                f"in_features {in_features} for plain param '{base}'"
+            )
+        group = in_features // num_groups
+        nibbles = torch.stack(
+            [(packed >> (4 * i)) & 0xF for i in range(8)], dim=-1
+        )
+        codes = (nibbles - 8).reshape(out_features, in_features).float()
+        scale_full = scale.repeat_interleave(group, dim=1)[:, :in_features]
+        out.append((base, (codes * scale_full).to(param.dtype)))
+    return out
 
 
 def _project_candidate_logits(
@@ -728,6 +803,7 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        weights = _dequantize_packed_for_plain_params(list(weights), params_dict)
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
