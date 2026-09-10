@@ -100,9 +100,6 @@ class GPTQLinearKernel:
         # used to be computed in the scheme and dropped here, so v2 weights
         # dequantized with zero+1 (REVIEW 2026-09-10 H1).
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
-        # Set in process_weights_after_loading once the on-device scale dtype
-        # is known.
-        self.fp16_compute = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # for torch.compile
@@ -132,14 +129,17 @@ class GPTQLinearKernel:
         # range) and the output is cast back; accumulation stays fp32 inside
         # the kernel, so the only new rounding is the finer-mantissa input
         # cast. SGLANG_RDNA_FP16_GPTQ=0 disables.
+        #
+        # The decision is per-layer: apply() dispatches on THIS layer's
+        # scale dtype, so a kernel instance shared across layers with mixed
+        # scale dtypes cannot have one layer's dtype govern the rest.
         from sglang.srt.utils.common import is_rdna_supported
 
-        self.fp16_compute = (
+        if (
             os.environ.get("SGLANG_RDNA_FP16_GPTQ", "1") == "1"
             and is_rdna_supported()
             and layer.scales.dtype == torch.bfloat16
-        )
-        if self.fp16_compute:
+        ):
             layer.scales = torch.nn.Parameter(
                 layer.scales.data.to(torch.float16), requires_grad=False
             )
@@ -159,29 +159,24 @@ class GPTQLinearKernel:
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
 
-        if self.fp16_compute:
-            output = gptq_gemm(
-                reshaped_x.to(torch.float16),
-                layer.qweight,
-                layer.qzeros,
-                layer.scales,
-                layer.g_idx,
-                self.use_shuffle,
-                self.quant_config.weight_bits,
-                self.use_v2_format,
-            )
+        # fp16 path iff THIS layer's scales are fp16 (set per layer in
+        # process_weights_after_loading). When serving dtype is fp16 the
+        # cast is a no-op on both ends.
+        gemm_x = reshaped_x
+        if layer.scales.dtype == torch.float16 and reshaped_x.dtype != torch.float16:
+            gemm_x = reshaped_x.to(torch.float16)
+        output = gptq_gemm(
+            gemm_x,
+            layer.qweight,
+            layer.qzeros,
+            layer.scales,
+            layer.g_idx,
+            self.use_shuffle,
+            self.quant_config.weight_bits,
+            self.use_v2_format,
+        )
+        if gemm_x is not reshaped_x:
             output = output.to(x.dtype)
-        else:
-            output = gptq_gemm(
-                reshaped_x,
-                layer.qweight,
-                layer.qzeros,
-                layer.scales,
-                layer.g_idx,
-                self.use_shuffle,
-                self.quant_config.weight_bits,
-                self.use_v2_format,
-            )
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)

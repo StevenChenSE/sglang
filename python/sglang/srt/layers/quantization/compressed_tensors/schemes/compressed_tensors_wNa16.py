@@ -3,6 +3,7 @@
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+import os
 from typing import Callable, Optional
 
 import torch
@@ -406,6 +407,28 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         permute_param_layout_(w_s, input_dim=0, output_dim=1)
         replace_parameter(layer, self.w_s_name, w_s.data.contiguous())
 
+        # E1 (review follow-up): CT W4A16 checkpoints store scales natively
+        # as F16 but they are materialized bf16 under bf16 serving; keep
+        # fp16 scales so apply_weights takes the v_dot2 fp16 GPTQ path,
+        # mirroring GPTQLinearKernel.process_weights_after_loading. Per
+        # layer by construction (this only touches this layer's param).
+        # SGLANG_RDNA_FP16_GPTQ=0 disables.
+        new_w_s = getattr(layer, self.w_s_name)
+        if (
+            os.environ.get("SGLANG_RDNA_FP16_GPTQ", "1") == "1"
+            and new_w_s.dtype == torch.bfloat16
+        ):
+            replace_parameter(
+                layer, self.w_s_name, new_w_s.data.to(torch.float16).contiguous()
+            )
+            if not getattr(self.__class__, "_fp16_scales_logged", False):
+                self.__class__._fp16_scales_logged = True
+                logger.info(
+                    "RDNA3 fp16 compressed-tensors W4A16 compute enabled "
+                    "(E1): fp16 scales, bf16 activations cast per call, "
+                    "output cast back."
+                )
+
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
         c = self.kernel_config
@@ -430,8 +453,14 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         if _is_rdna3:
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
             out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
+            # fp16 path iff this layer's scales are fp16 (E1, set per layer
+            # in _process_weights_after_loading_rdna3); no-op when serving
+            # dtype is fp16.
+            gemm_x = x_2d
+            if w_s.dtype == torch.float16 and x_2d.dtype != torch.float16:
+                gemm_x = x_2d.to(torch.float16)
             output = _rdna3_gptq_gemm(
-                x_2d,
+                gemm_x,
                 w_q,
                 w_zp,
                 w_s,
@@ -439,6 +468,8 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                 True,  # use_shuffle: weights are pre-shuffled (exllama layout)
                 c.weight_type.size_bits,
             )
+            if gemm_x is not x_2d:
+                output = output.to(x.dtype)
             if bias is not None:
                 output = output + bias
             return output.reshape(out_shape)
