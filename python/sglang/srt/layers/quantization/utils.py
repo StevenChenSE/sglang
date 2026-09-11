@@ -18,6 +18,18 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
+# NOTE (review 2026-09-11 4.1, A/B-tested 2026-09-09): allocating W4A16 scale
+# params directly in fp16 (so the checkpoint's native F16 scale values avoid
+# bf16 rounding) was implemented and measured WORSE end-to-end on this
+# deployment: single-stream TG 93.6 -> 87.8 tok/s, spec accept 6.0 -> 5.0,
+# depth-grid d0/d16k down. Mechanism: the DFlash2 draft's weights are
+# dequantized from the same checkpoint with the same (bf16-rounded) scales,
+# so rounding the target's scales the same way keeps the draft/target pair
+# consistent; exact-F16 target scales shift the target argmax away from the
+# draft proposals. Do NOT re-attempt without re-running the drafter-side
+# dequant consistently.
+
+
 def get_scalar_types():
     """
     Returns:

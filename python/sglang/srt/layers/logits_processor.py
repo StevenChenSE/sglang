@@ -939,66 +939,47 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                # JOURNAL 12.103/12.105: int8 draft-head GEMV. The dispatch flag
-                # lives on the logits_processor INSTANCE (_i8_head), NOT on the
-                # shared lm_head module — the target's processor never carries
-                # it, so target logits stay exact fp16. The draft processor's
-                # M<=4 calls run the HIP int8 kernel (1.85-1.9x wvSplitK).
-                _i8pair = getattr(self, "_i8_head", None)
+                # Small-M logits GEMV fast path (HIP): the vocab-parallel
+                # lm_head GEMV at M<=8 was hitting rocBLAS MFMA tiles at
+                # ~0.44 TB/s (~0.9ms per draft step). The row-contiguous
+                # Triton kernel streams W at ~1 TB/s. Weight is [N, K]
+                # row-major (vocab_shard, hidden) — matches skinny_linear.
+                #
+                # M9 hygiene (review 2026-09-11): the int8 draft-head GEMV
+                # gate that used to sit in front of this (JOURNAL
+                # 12.103/12.105, keyed on a `_i8_head` instance attribute)
+                # is gone — nothing in-tree ever assigned that attribute, so
+                # the branch was unreachable; the skinny/matmul dispatch
+                # below is the only live path.
+                _x2 = hidden_states.to(lm_head.weight.dtype)
                 if (
-                    _i8pair is not None
-                    and _IS_HIP_SMALL_M
-                    and hidden_states.dim() == 2
-                    and 0 < hidden_states.shape[0] <= 4
-                    and hidden_states.dtype in (torch.float16, torch.bfloat16)
-                    and _i8pair[0].is_contiguous()
+                    _IS_HIP_SMALL_M
+                    and _x2.dim() == 2
+                    and 0 < _x2.shape[0] <= 8
+                    and lm_head.weight.dim() == 2
+                    and lm_head.weight.is_contiguous()
+                    and lm_head.weight.dtype in (torch.float16, torch.bfloat16)
                 ):
-                    from sglang.kernels.ops.gemm.rdna_i8_gemv import (
-                        i8_gemv_linear,
+                    from sglang.kernels.ops.gemm.rdna_skinnym_gemm import (
+                        skinny_linear,
                     )
 
                     _prewarm_small_m_logits()
-                    # 12.116: bf16-stack gate — cast x to fp16 (the kernel's
-                    # input contract); a [M,5120] cast is ~us. 12.122's dtype
-                    # flip to bf16 had silently disabled this path.
-                    logits = i8_gemv_linear(
-                        hidden_states.to(torch.float16), _i8pair[0], _i8pair[1]
-                    )
-                else:
-                    # Small-M logits GEMV fast path (HIP): the vocab-parallel
-                    # lm_head GEMV at M<=8 was hitting rocBLAS MFMA tiles at
-                    # ~0.44 TB/s (~0.9ms per draft step). The row-contiguous
-                    # Triton kernel streams W at ~1 TB/s. Weight is [N, K]
-                    # row-major (vocab_shard, hidden) — matches skinny_linear.
-                    _x2 = hidden_states.to(lm_head.weight.dtype)
-                    if (
-                        _IS_HIP_SMALL_M
-                        and _x2.dim() == 2
-                        and 0 < _x2.shape[0] <= 8
-                        and lm_head.weight.dim() == 2
-                        and lm_head.weight.is_contiguous()
-                        and lm_head.weight.dtype in (torch.float16, torch.bfloat16)
-                    ):
-                        from sglang.kernels.ops.gemm.rdna_skinnym_gemm import (
-                            skinny_linear,
+                    if _x2.shape[0] <= 4 and _x2.dtype == torch.float16:
+                        # Ported vLLM wvSplitK: 871us (893GB/s) vs row_dot
+                        # 1036/1531us at M=1/4 — JOURNAL 12.31/12.32.
+                        global _WV_CU_COUNT
+                        if _WV_CU_COUNT is None:
+                            _WV_CU_COUNT = torch.cuda.get_device_properties(
+                                _x2.device
+                            ).multi_processor_count
+                        logits = torch.ops.sgl_kernel.wvSplitK(
+                            lm_head.weight, _x2, None, _WV_CU_COUNT
                         )
-
-                        _prewarm_small_m_logits()
-                        if _x2.shape[0] <= 4 and _x2.dtype == torch.float16:
-                            # Ported vLLM wvSplitK: 871us (893GB/s) vs row_dot
-                            # 1036/1531us at M=1/4 — JOURNAL 12.31/12.32.
-                            global _WV_CU_COUNT
-                            if _WV_CU_COUNT is None:
-                                _WV_CU_COUNT = torch.cuda.get_device_properties(
-                                    _x2.device
-                                ).multi_processor_count
-                            logits = torch.ops.sgl_kernel.wvSplitK(
-                                lm_head.weight, _x2, None, _WV_CU_COUNT
-                            )
-                        else:
-                            logits = skinny_linear(_x2, lm_head.weight)
                     else:
-                        logits = torch.matmul(_x2, lm_head.weight.T)
+                        logits = skinny_linear(_x2, lm_head.weight)
+                else:
+                    logits = torch.matmul(_x2, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

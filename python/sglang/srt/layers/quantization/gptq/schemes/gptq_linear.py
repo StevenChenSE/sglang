@@ -129,6 +129,10 @@ class GPTQLinearScheme(GPTQLinearSchemeBase):
             "data": torch.empty(
                 scale_and_zero_size,
                 output_size_per_partition,
+                # bf16 (not fp16) by measured A/B: the DFlash2 draft
+                # dequantizes from the same checkpoint with the same
+                # bf16-rounded scales — see the note in
+                # layers/quantization/utils.py before changing this.
                 dtype=params_dtype,
             ),
             "weight_loader": weight_loader,

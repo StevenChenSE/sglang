@@ -196,6 +196,8 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             torch.empty(
                 output_size_per_partition,
                 scales_and_zp_size,
+                # bf16 by measured A/B — see the note in
+                # layers/quantization/utils.py before changing this.
                 dtype=params_dtype,
             )
         }

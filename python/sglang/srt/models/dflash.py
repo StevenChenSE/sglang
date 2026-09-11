@@ -173,8 +173,13 @@ def _project_candidate_logits(
         # skinny path streams the same [vocab_shard, hidden] weight at the
         # HBM roofline. Same gate + eager-prewarm contract as
         # logits_processor (compile before the draft graph captures this).
+        # RDNA-qualified (4.6): skinny_linear is portable Triton but only
+        # tuned for gfx1100 tile shapes.
+        from sglang.srt.utils.common import is_rdna_supported
+
         if (
-            x.dim() == 2
+            is_rdna_supported()
+            and x.dim() == 2
             and 0 < x.shape[0] <= 8
             and weight.dim() == 2
             and weight.is_contiguous()
