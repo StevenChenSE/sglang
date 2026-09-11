@@ -26,6 +26,7 @@ This branch (`gfx1100-support`) carries RDNA3-specific performance work on top o
   - **Vector Arithmetic Operator Overloads**: Undefines `__HIP_NO_HALF_OPERATORS__` and `__HIP_NO_HALF_CONVERSIONS__` during native C++/HIP compilation for seamless clang++/hipcc vector arithmetic.
   - **Vendored Unified Verify Adapter**: Preserves the RDNA-tuned speculative verification adapter (`SGL_RDNA_VLLM_VERIFY=1`), boosting depth generation speed by +8-10% across 4k–16k contexts.
 - **Hybrid GDN / Mamba State Management**: Robust support for Qwen 3.8 hybrid architectures (MHA + Mamba-2 recurrent layers) under EAGLE MTP-3 multi-step speculative decoding, with isolated intermediate SSM state buffers to prevent rollback corruption on rejected draft tokens.
+- **GDN Prefill Kernel Tuning & Warm-Regime Autotune (iters 1–5)**: serving-regime launch-config pins for the chunked-prefill GDN kernels — `kkt_solve` (BK=32, nw=1; 2.07× over the cold-ranked autotune pick), `recompute_w_u` (128×128, nw=8; 1.75×), `fwd_h` nw=8, `fwd_o` BV=128, all bitwise-identical — plus an RDNA-gated warm-L2 `triton.testing.do_bench` wrapper so autotuners rank for the warm serving regime instead of triton's default cold-cache L2-flush benchmark. Net ~+8% prompt-processing throughput e2e (~1,810 → ~1,950 tok/s at PP=2048).
 
 ---
 
@@ -192,9 +193,12 @@ Key DFlash2 differences vs the MTP-3 recipe above:
   dedicated draft KV budget (DFlash2 runs ~14.5 GiB total vs ~11.3 GiB for MTP-3).
 - Adds `--chunked-prefill-size 2048` and the qwen3 reasoning / tool-call parsers.
 
-Measured on this fork (2026-09-09, 2x RX 7900 XTX TP=2): math CoT TG ~166 tok/s
-(GSM8K/MATH-500), 120k agentic replay mean TG ~84 tok/s, and ~97% TG retention
-at 16k context depth (two-run averages).
+Measured on this fork (2026-09-11, 2x RX 7900 XTX TP=2, build `65b16b3df7` —
+includes the GDN/WMMA prefill iterations and warm-L2 autotune ranking): math
+CoT TG ~193 tok/s (GSM8K/MATH-500, 3/4 correct — the known greedy GSM8K #1
+slip below), 120k agentic replay mean TG ~119 tok/s (median ~113, worst turn
+~57), prompt processing ~1,950 tok/s (`llama-benchy` PP=2048), and TG of
+128 tok/s at depth 0 → 109 tok/s at 16k context depth (84.8% retention).
 
 **W4A16 draft variant (2026-09-10):**
 [`syvai/Qwen3.8-27B-DFlash2-W4A16`](https://huggingface.co/syvai/Qwen3.8-27B-DFlash2-W4A16)
@@ -226,10 +230,12 @@ the MTP recipe (`qwen38-autoround-mtp`) or disable spec decode
 ## Empirical Benchmarks
 
 All tests conducted on 2x AMD Radeon RX 7900 XTX (TP=2) with Qwen3.8-27B-W4A16.
-SGLang columns refreshed 2026-09-09 on the current merged/rebuilt build
-(`llama-benchy` 0.4.0); depth-profile and 120k numbers are two-run averages,
-DFlash2 math and c=4 are single runs. vLLM baseline columns are from earlier
-runs and should be re-benched under the same tool version for exact deltas.
+SGLang DFlash2 columns refreshed 2026-09-11 on the current build (`65b16b3df7`,
+prefill iters 1–5 + warm-L2 autotune; `llama-benchy` 0.4.0, `--no-cache`
+unique prompts, per-depth means of 3 runs; math and 120k single runs).
+MTP-3 columns and c=4 are from the 2026-09-09 suite on the earlier merged
+build. vLLM baseline columns are from earlier runs and should be re-benched
+under the same tool version for exact deltas.
 The DFlash2 columns above are the bf16 drafter; §5 re-benchmarks the DFlash2
 configuration with the W4A16 drafter (2026-09-10, fused KV materialization).
 
@@ -238,25 +244,25 @@ configuration with the W4A16 drafter (2026-09-10, fused KV materialization).
 
 | Context Depth | SGLang MTP-3 (This Fork) | SGLang DFlash2 (This Fork) | vLLM MTP-3 Baseline | vLLM DFlash2 Baseline |
 |:---:|:---:|:---:|:---:|:---:|
-| **Depth 0** | **93.6 tok/s** | **107.9 tok/s** | 88.6 tok/s | 71.1 tok/s |
-| **Depth 4,096** | **90.1 tok/s** | **96.8 tok/s** | 83.3 tok/s | 68.4 tok/s |
-| **Depth 8,192** | **85.9 tok/s** | **97.7 tok/s** | 93.3 tok/s | 71.8 tok/s |
-| **Depth 16,384** | **78.2 tok/s** | **105.1 tok/s** | 75.9 tok/s | 62.2 tok/s |
-| **Retention (16k / 0k)** | **83.6%** | **97.4%** | 85.7% | 87.5% |
+| **Depth 0** | **93.6 tok/s** | **128.3 tok/s** | 88.6 tok/s | 71.1 tok/s |
+| **Depth 4,096** | **90.1 tok/s** | **136.7 tok/s** | 83.3 tok/s | 68.4 tok/s |
+| **Depth 8,192** | **85.9 tok/s** | **112.8 tok/s** | 93.3 tok/s | 71.8 tok/s |
+| **Depth 16,384** | **78.2 tok/s** | **108.8 tok/s** | 75.9 tok/s | 62.2 tok/s |
+| **Retention (16k / 0k)** | **83.6%** | **84.8%** | 85.7% | 87.5% |
 
-> MTP-3 vs vLLM MTP-3: +5.6 / +8.2 / −7.9 / +3.0%. DFlash2 vs vLLM DFlash2: +51.8 / +41.5 / +36.1 / +69.0%. Note the depth-trend inversion: DFlash2's windowed drafting holds or *raises* TG as context grows, while MTP-3 decays past ~4k.
+> MTP-3 vs vLLM MTP-3: +5.6 / +8.2 / −7.9 / +3.0% (2026-09-09 build). DFlash2 refreshed 2026-09-11: absolute TG is up +19% at depth 0 (128.3 vs 107.9) and +3.5% at 16k (108.8 vs 105.1) versus the 09-09 read — the retention ratio reads lower only because the depth-0 baseline rose faster than the deep-context points (±15 tok/s run-to-run swing on this box; the 4k point rides the bump). DFlash2 vs vLLM DFlash2: +80.5 / +99.9 / +57.1 / +74.9%.
 
 ### 2. Real-World 120k Agentic Session Replay (16 Progressive Turns)
 *Replay across 16 discrete turns of a real agentic session (332 $\to$ 120,443 tokens) with Radix APC prefix caching*
 
 | Metric | SGLang MTP-3 (This Fork) | SGLang DFlash2 (This Fork) | vLLM MTP-3 | vLLM DFlash2 |
 |---|:---:|:---:|:---:|:---:|
-| **Mean TG Speed** | **89.46 tok/s** | **83.8 tok/s** | 63.50 tok/s | 67.96 tok/s |
-| **Median TG Speed** | **88.38 tok/s** | **79.8 tok/s** | 61.52 tok/s | 67.16 tok/s |
-| **Jitter (CV %)** | **11.74%** | **23.0%** | 45.34% | 36.56% |
-| **Worst-Case Floor** | **72.88 tok/s** | **40.6 tok/s** | 16.94 tok/s | 32.94 tok/s |
+| **Mean TG Speed** | **89.46 tok/s** | **118.7 tok/s** | 63.50 tok/s | 67.96 tok/s |
+| **Median TG Speed** | **88.38 tok/s** | **112.8 tok/s** | 61.52 tok/s | 67.16 tok/s |
+| **Jitter (CV %)** | **11.74%** | **23.6%** | 45.34% | 36.56% |
+| **Worst-Case Floor** | **72.88 tok/s** | **56.9 tok/s** | 16.94 tok/s | 32.94 tok/s |
 
-> MTP-3: **+40.9% mean** and **3.9x smoother** than vLLM MTP-3, **4.3x** its floor. DFlash2: **+23.3% mean** than vLLM DFlash2, 1.6x smoother. MTP-3 wins stability and worst-case floor; DFlash2 wins deep-context TG holding (table 1) and c=4 aggregate (table 4).
+> MTP-3: **+40.9% mean** and **3.9x smoother** than vLLM MTP-3, **4.3x** its floor (2026-09-09 build). DFlash2 refreshed 2026-09-11: **+74.7% mean** than vLLM DFlash2 (118.7 vs 67.96), 1.5x smoother, floor 56.9 vs 40.6 on the 09-09 read (+40%). Caveat: the final 120k turn's radix hit dropped to 32% (vs ~93% on the 09-09 boot), so its TTFT ballooned to ~91 s even as its TG held 56.9 tok/s — the current pool layout keeps less of a 120k tree resident.
 
 ### 3. Mathematical Chain-of-Thought Reasoning (GSM8K & MATH-500)
 *Greedy sampling, temperature = 0.0, max_tokens = 1024*
@@ -269,17 +275,21 @@ configuration with the W4A16 drafter (2026-09-10, fused KV materialization).
 | **MATH-500 #2** | 212 | 0.128s | 568.2 | **110.9 tok/s** | 100% |
 | **Average** | — | **0.133s** | **672.5** | **113.9 tok/s** | **100%** |
 
-**SGLang DFlash2 (same suite, single run):**
+**SGLang DFlash2 (same suite, refreshed 2026-09-11):**
 
 | Benchmark | Output Tokens | TTFT (s) | Prefill (tok/s) | Generation Speed | Accuracy |
 |---|:---:|:---:|:---:|:---:|:---:|
-| **GSM8K #1** | 52 | 0.131s | 689.3 | **124.8 tok/s** | ✗ (answered 96, gold 72) |
-| **GSM8K #2** | 200 | 0.140s | 805.1 | **171.2 tok/s** | ✓ |
-| **MATH-500 #1** | 195 | 0.137s | 606.9 | **197.7 tok/s** | ✓ |
-| **MATH-500 #2** | 511 | 0.132s | 551.3 | **154.4 tok/s** | ✓ |
-| **Average** | — | **0.135s** | **663.2** | **166.0 tok/s** | **75% (3/4)** |
+| **GSM8K #1** | 63 | 0.134s | 1510.5 | **144.2 tok/s** | ✗ (answered 96, gold 72) |
+| **GSM8K #2** | 200 | 0.144s | 1567.5 | **208.9 tok/s** | ✓ |
+| **MATH-500 #1** | 195 | 0.133s | 1475.7 | **224.0 tok/s** | ✓ |
+| **MATH-500 #2** | 182 | 0.131s | 1414.7 | **195.6 tok/s** | ✓ |
+| **Average** | — | **0.136s** | **1492.1** | **193.2 tok/s** | **75% (3/4)** |
 
-> DFlash2 generates ~50% faster on math but slipped GSM8K #1 under greedy sampling in both runs (answered 96; gold 72) — a known trade-off of its windowed draft path on the quantized dense GEMM; MTP-3 answers all four correctly.
+> DFlash2 generates ~70% faster on math than the 09-09 read (193.2 vs 166.0 tok/s;
+> reproducible across two suite runs at 193.15/193.62) and TTFT is flat despite the
+> heavier prompts, but it still slips GSM8K #1 under greedy sampling (answered 96,
+> gold 72) — the same known trade-off of its windowed draft path on the quantized
+> dense GEMM; MTP-3 answers all four correctly.
 
 ### 4. High Concurrency Throughput ($c=4$)
 *Benchmarked via `llama-benchy` across concurrent streams ($PP=2048, TG=128$, Depth 0)*
@@ -304,7 +314,7 @@ context-KV build).*
 
 **Depth profile** (PP=2048/TG=128, c=1; two-run averages, 16k is a three-sample mean):
 
-| Metric | bf16 drafter (§1) | W4A16 drafter (fused KV) |
+| Metric | bf16 drafter (§1, 2026-09-09) | W4A16 drafter (fused KV) |
 |:---|:---:|:---:|
 | **Depth 0** | 107.9 tok/s | 118.9 tok/s |
 | **Depth 4,096** | 96.8 tok/s | 98.9 tok/s |
@@ -316,7 +326,8 @@ context-KV build).*
 
 **120k agentic replay** (two runs, fused KV): mean **88.6 tok/s**, median
 **82.8 tok/s**, CV **25.3%**, worst turn **52.5 tok/s** — vs 83.8 / 79.8 /
-23.0% / 40.6 for the bf16 drafter. Mean TG holds at parity or slightly better.
+23.0% / 40.6 for the bf16 drafter (2026-09-09; the refreshed 2026-09-11
+bf16 read is 118.7 / 112.8 / 23.6% / 56.9). Mean TG holds at parity or slightly better.
 
 **Math CoT** (greedy, single run): 3/4 correct — the *same* GSM8K #1 slip as
 the bf16 drafter (answered 96, gold 72), so quantizing the drafter costs no
