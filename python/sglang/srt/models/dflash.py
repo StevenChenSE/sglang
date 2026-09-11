@@ -166,7 +166,29 @@ def _project_candidate_logits(
     """Project draft hiddens through the target head, restricted to the org vocab."""
     if not use_quant_head:
         weight = lm_head.weight
-        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+        x = hidden.to(weight.dtype)
+        # E7 (efficiency review 2026-09-11): the DFlash2 selector's head
+        # projection hit rocBLAS MFMA tiles at ~0.5 TB/s under TP (the
+        # 2.5 ms/step MT64x64x32 GEMM in the live profile); the small-M
+        # skinny path streams the same [vocab_shard, hidden] weight at the
+        # HBM roofline. Same gate + eager-prewarm contract as
+        # logits_processor (compile before the draft graph captures this).
+        if (
+            x.dim() == 2
+            and 0 < x.shape[0] <= 8
+            and weight.dim() == 2
+            and weight.is_contiguous()
+            and weight.dtype in (torch.float16, torch.bfloat16)
+        ):
+            from sglang.kernels.ops.gemm.rdna_skinnym_gemm import skinny_linear
+            from sglang.srt.layers.logits_processor import (
+                _prewarm_small_m_logits,
+            )
+
+            _prewarm_small_m_logits()
+            w = weight[:num_org] if weight.shape[0] != num_org else weight
+            return skinny_linear(x, w)
+        return torch.matmul(x, weight[:num_org].T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
     # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
     # mask the padded tail out of the top-k instead.
