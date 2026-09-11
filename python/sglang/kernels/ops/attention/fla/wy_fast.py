@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.srt.utils.common import is_rdna_supported
 
 
 # @triton.autotune(
@@ -126,8 +127,14 @@ def recompute_w_u_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
-    BV = 64
+    # gfx1100 serving-regime sweep (scripts/gdn_prefill_sweep2.py, warm-L2
+    # 4-seq varlen prefill, T=2048 Hg=8 H=24 K=V=128): BK=128/BV=128/nw=8
+    # is 1.75x faster than the FLA defaults with bitwise-identical output.
+    # RDNA-gated so other platforms keep the tuned defaults.
+    if is_rdna_supported():
+        BK, BV, num_warps, num_stages = 128, 128, 8, 3
+    else:
+        BK, BV, num_warps, num_stages = 64, 64, 4, 3
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
@@ -149,8 +156,8 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return w, u
 

@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_tf32_supported,
 )
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.srt.utils.common import is_rdna_supported
 
 # TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
 # The numerically sensitive forward-substitution uses scalar ops, not tl.dot.
@@ -28,11 +29,22 @@ else:
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ],
+    configs=(
+        [
+            triton.Config({"BK": BK}, num_warps=num_warps)
+            for BK in [32, 64]
+            for num_warps in [1, 2, 4]
+        ]
+        if not is_rdna_supported()
+        else [
+            # gfx1100 serving-regime winner (scripts/gdn_prefill_sweep2.py,
+            # warm-L2 4-seq varlen prefill, T=2048 Hg=8 H=24 K=128):
+            # 87us vs 180us for (64,4), bitwise-identical output. A single
+            # config also skips triton's autotune bench, whose L2 flush
+            # makes it pick the slower (64,4) under serving's warm cache.
+            triton.Config({"BK": 32}, num_warps=1),
+        ]
+    ),
     key=["H", "Hg", "K", "BC"],
     **autotune_cache_kwargs,
 )
