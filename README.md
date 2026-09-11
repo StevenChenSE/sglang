@@ -194,7 +194,8 @@ Key DFlash2 differences vs the MTP-3 recipe above:
 - Adds `--chunked-prefill-size 2048` and the qwen3 reasoning / tool-call parsers.
 
 Measured on this fork (2026-09-11, 2x RX 7900 XTX TP=2, build `65b16b3df7` —
-includes the GDN/WMMA prefill iterations and warm-L2 autotune ranking): math
+includes the GDN/WMMA prefill iterations and warm-L2 autotune ranking, running
+the **W4A16 drafter**, the standing production config): math
 CoT TG ~193 tok/s (GSM8K/MATH-500, 3/4 correct — the known greedy GSM8K #1
 slip below), 120k agentic replay mean TG ~119 tok/s (median ~113, worst turn
 ~57), prompt processing ~1,950 tok/s (`llama-benchy` PP=2048), and TG of
@@ -236,8 +237,12 @@ unique prompts, per-depth means of 3 runs; math and 120k single runs).
 MTP-3 columns and c=4 are from the 2026-09-09 suite on the earlier merged
 build. vLLM baseline columns are from earlier runs and should be re-benched
 under the same tool version for exact deltas.
-The DFlash2 columns above are the bf16 drafter; §5 re-benchmarks the DFlash2
-configuration with the W4A16 drafter (2026-09-10, fused KV materialization).
+The DFlash2 columns above run the **W4A16 drafter** (the production default
+via the `zz-w4a16-draft.conf` systemd drop-in since 2026-09-08; pool grows to
+214,284 tokens). A same-day bf16-drafter cross-check on the identical build
+read 181.0 tok/s math / 119.3 tok/s 120k-mean / 114.3 depth-mean at pool
+189,172 — at or below the W4A16 column everywhere, so W4A16 stays. §5 records
+the original 2026-09-10 W4A16 validation and the bf16 columns it replaced.
 
 ### 1. Standardized Context Depth Profile (`llama-benchy`)
 *Standard prompt prefill ($PP=2048$) and token generation ($TG=128$), concurrency = 1*
@@ -314,7 +319,7 @@ context-KV build).*
 
 **Depth profile** (PP=2048/TG=128, c=1; two-run averages, 16k is a three-sample mean):
 
-| Metric | bf16 drafter (§1, 2026-09-09) | W4A16 drafter (fused KV) |
+| Metric | bf16 drafter (2026-09-09) | W4A16 drafter (fused KV) |
 |:---|:---:|:---:|
 | **Depth 0** | 107.9 tok/s | 118.9 tok/s |
 | **Depth 4,096** | 96.8 tok/s | 98.9 tok/s |
@@ -326,8 +331,8 @@ context-KV build).*
 
 **120k agentic replay** (two runs, fused KV): mean **88.6 tok/s**, median
 **82.8 tok/s**, CV **25.3%**, worst turn **52.5 tok/s** — vs 83.8 / 79.8 /
-23.0% / 40.6 for the bf16 drafter (2026-09-09; the refreshed 2026-09-11
-bf16 read is 118.7 / 112.8 / 23.6% / 56.9). Mean TG holds at parity or slightly better.
+23.0% / 40.6 for the 2026-09-09 bf16 drafter, and 119.3 / 125.5 mean for the
+2026-09-11 bf16 / W4A16 single-run reads. Mean TG holds at parity or slightly better.
 
 **Math CoT** (greedy, single run): 3/4 correct — the *same* GSM8K #1 slip as
 the bf16 drafter (answered 96, gold 72), so quantizing the drafter costs no
