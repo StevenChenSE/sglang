@@ -2037,6 +2037,14 @@ __global__ void gemm_q4_wmma_kernel_128x64_k32(const T*, const uint32_t*,
                                                const int*) {}
 #endif
 
+// Prefill-review iter 2 diagnostics: force a tile variant / K-split for the
+// M>=128 WMMA dispatch regardless of the heuristics. Sweep-only knobs; unset
+// (=0) keeps the shipped auto dispatch bit-for-bit.
+static int wmma_env_int(const char* name) {
+  const char* e = getenv(name);
+  return e ? atoi(e) : 0;
+}
+
 template <typename T>
 void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
                                   const uint32_t* b_qzeros, const T* b_scales,
@@ -2058,14 +2066,35 @@ void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
   // scale. Falls back to V7 (K=16/iter) otherwise. V7/V8 read A sequentially,
   // so act-order (b_q_perm != null) must skip them and use v5, which honors
   // the perm.
-  if (size_m >= 128 && b_q_perm == nullptr) {
-    const int k_split =
-        compute_wmma_k_split_mn(size_m, size_n, size_k, 128, 64);
+  const int force_v = wmma_env_int("SGL_RDNA_WMMA_VARIANT");
+  const int force_ks = wmma_env_int("SGL_RDNA_WMMA_KSPLIT");
+  // K-split chooser honoring the forced value when it is legal for the
+  // tile's K granularity (kmod = 32 for the k32 tile, 16 otherwise).
+  auto pick_split = [&](int m_tile, int n_tile, int kmod) {
+    // A forced split only applies when legal for the tile's K granularity;
+    // otherwise the shipped heuristic stands (auto behavior unchanged).
+    const int ks = force_ks;
+    if (ks > 0 && size_k % ks == 0 && (size_k / ks) % kmod == 0) return ks;
+    return compute_wmma_k_split_mn(size_m, size_n, size_k, m_tile, n_tile);
+  };
+
+  // Forced small tiles bypass the M>=128 dispatch entirely.
+  if (force_v == 4) {
+    launch_gemm_q4_wmma_64x32_4w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
+                                    c, size_m, size_n, size_k, groups,
+                                    zero_offset, stream);
+    return;
+  }
+
+  if (size_m >= 128 && b_q_perm == nullptr && force_v != 3) {
     const int groupsize = size_k / groups;
+    const bool k32_ok =
+        size_k % 32 == 0 && groupsize >= 32 && groupsize % 32 == 0 &&
+        force_v != 2;
+    const int k_split = pick_split(128, 64, k32_ok ? 32 : 16);
     dim3 block(256);
     dim3 grid((size_n + 63) / 64, (size_m + 127) / 128, k_split);
-    if (size_k % 32 == 0 && groupsize >= 32 && groupsize % 32 == 0 &&
-        (size_k / k_split) % 32 == 0) {
+    if (k32_ok && (size_k / k_split) % 32 == 0) {
       gemm_q4_wmma_kernel_128x64_k32<T><<<grid, block, 0, stream>>>(
           a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
           zero_offset, b_q_perm);
@@ -2078,7 +2107,7 @@ void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
   }
 
   // 4 waves per block (128 threads), 64M × 64N tile per block.
-  const int k_split = compute_wmma_k_split_mn(size_m, size_n, size_k, 64, 64);
+  const int k_split = pick_split(64, 64, 16);
   dim3 block(128);
   dim3 grid((size_n + 63) / 64, (size_m + 63) / 64, k_split);
   gemm_q4_wmma_kernel_64x64_4w<T><<<grid, block, 0, stream>>>(
