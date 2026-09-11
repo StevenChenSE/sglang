@@ -183,31 +183,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if self.config.tie_word_embeddings:
             return
 
-        import os
-        if os.environ.get("SGL_RDNA_FP8_DRAFT_HEAD", "0") == "1":
-            # 12.116: private fp8-e4m3 head copy for the DRAFT loop only.
-            # set_lm_head_from_target's default SHARES the target's head
-            # module — quantizing in place would poison verification. The
-            # draft only argmaxes (topk=1, no rejection sampling) and the
-            # target still gates acceptance, so a quantized proposal
-            # distribution costs a little accept rate, never correctness
-            # (offline argmax agreement 1.0000, JOURNAL 12.116).
-            try:
-                from sglang.kernels.ops.gemm.rdna_skinnym_gemm import (
-                    quantize_head_fp8,
-                )
-
-                w = target_lm_head.weight
-                if w.dtype != torch.bfloat16:
-                    w = w.to(torch.bfloat16)
-                q, scale = quantize_head_fp8(w.data)
-                holder = copy.copy(target_lm_head)
-                holder.weight = q
-                holder._fp8_scale = scale
-                self.lm_head = holder
-                return
-            except Exception as e:
-                print(f"[rdna] fp8 draft-head build failed ({e!r}); sharing bf16")
+        # M9 hygiene (review 2026-09-11): the SGL_RDNA_FP8_DRAFT_HEAD block
+        # that used to sit here stored a private fp8 head copy plus its
+        # per-row scale on `holder._fp8_scale`, but nothing in-tree ever
+        # read that attribute — with the flag on, the fp8 weight fell
+        # through to torch.matmul with the scale silently dropped. Do not
+        # re-add without also wiring a row_dot_fp8 dispatch in the logits
+        # path; its measured 421 GB/s also loses to the bf16 skinny path.
         self.lm_head = target_lm_head
 
     @torch.no_grad()
