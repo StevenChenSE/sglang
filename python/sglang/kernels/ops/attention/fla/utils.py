@@ -33,6 +33,74 @@ autotune_cache_kwargs = (
 )
 
 
+def _install_rdna_warm_autotune_benchmark() -> None:
+    """
+    gfx1100: triton's default autotune benchmarker (``do_bench``) clears L2
+    before every benchmark iteration, so autotune ranks configs for
+    cold-cache conditions. Serving kernels run warm — tensors stay resident
+    across layers — and the flushed ranking picks the wrong config even when
+    the warm-regime winner is in the config list: measured on the GDN
+    kkt_solve kernel, the flushed bench picked (BK=64, nw=4) while the warm
+    serving regime runs (BK=32, nw=1) at 2.07x (commit 64f744aff2).
+
+    Swap ``triton.testing.do_bench`` for a wrapper that runs triton's own
+    benchmark with the driver's L2 clear neutered. The AMD driver resolves
+    the benchmarker through ``from triton.testing import do_bench`` inside
+    ``get_benchmarker()`` at benchmark time, so this single swap covers
+    every triton.autotune site in the process. RDNA-gated: NVIDIA/CDNA keep
+    stock tuning behavior. Re-run once after enabling with a cleared
+    triton cache — persisted autotune results were ranked cold.
+    """
+    if os.getenv("SGLANG_FLA_COLD_AUTOTUNE_BENCH", "0") == "1":
+        return
+    try:
+        from sglang.srt.utils.common import is_rdna_supported
+
+        if not is_rdna_supported():
+            return
+    except Exception:
+        return
+
+    import triton.testing as testing
+
+    if getattr(testing.do_bench, "_sglang_warm_l2_bench", False):
+        return
+    orig_do_bench = testing.do_bench
+
+    def warm_do_bench(fn, **kwargs):
+        driver_cls = type(triton.runtime.driver.active)
+        with _neutered_l2_clear(driver_cls):
+            return orig_do_bench(fn, **kwargs)
+
+    warm_do_bench._sglang_warm_l2_bench = True
+    testing.do_bench = warm_do_bench
+    logger.info("FLA autotune benchmark: L2 flush disabled (RDNA warm regime)")
+
+
+class _neutered_l2_clear:
+    """Temporarily no-op the driver's benchmark L2 clear (and its 256 MB
+    scratch allocation) so autotune ranks configs for the warm cache state
+    serving actually runs in."""
+
+    def __init__(self, driver_cls):
+        self._cls = driver_cls
+
+    def __enter__(self):
+        self._clear = self._cls.clear_cache
+        self._empty = self._cls.get_empty_cache_for_benchmark
+        self._cls.clear_cache = lambda self, cache: None
+        self._cls.get_empty_cache_for_benchmark = (
+            lambda self: torch.empty(1, device="cuda")
+        )
+
+    def __exit__(self, *exc):
+        self._cls.clear_cache = self._clear
+        self._cls.get_empty_cache_for_benchmark = self._empty
+
+
+_install_rdna_warm_autotune_benchmark()
+
+
 @lru_cache(maxsize=1)
 def check_environments():
     """
