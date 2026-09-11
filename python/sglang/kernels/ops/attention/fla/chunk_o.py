@@ -11,9 +11,15 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.utils.common import is_rdna_supported
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+# BV=128 gives one program per chunk-head (halves the redundant
+# b_A = q @ k^T work; ~15% faster, bitwise-identical) — tuned on gfx1100
+# prefill shapes only (scripts/gdn_prefill_sweep.py); other platforms keep
+# the FLA default of 64.
+FWD_O_BV = 128 if is_rdna_supported() else 64
 
 
 # @triton.autotune(
@@ -167,11 +173,7 @@ def chunk_fwd_o(
         V=V,
         BT=BT,
         BK=128,
-        # BV=128 halves the program count (one per chunk-head), which halves
-        # the redundant b_A = q @ k^T work; bitwise-identical output and
-        # ~15% faster than BV=64 at the gfx1100 serving prefill shapes
-        # (scripts/gdn_prefill_sweep.py, T=2048 Hg=8 H=24 K=V=128).
-        BV=128,
+        BV=FWD_O_BV,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,

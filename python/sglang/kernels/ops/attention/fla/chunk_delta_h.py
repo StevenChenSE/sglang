@@ -18,14 +18,22 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.utils.common import is_rdna_supported
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 # gfx1100 prefill sweep (scripts/gdn_prefill_sweep.py, T=2048 Hg=8 H=24
-# K=V=128): nw=8 cuts the kernel 15-18% vs nw=4 with bitwise-identical
-# output; ns=1 with nw=8 is non-deterministic, so ns stays 2.
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "8"))
+# K=V=128): nw=8 cuts the kernel 15-18% in isolation and ~46% in serving
+# with bitwise-identical output; ns=1 with nw=8 is non-deterministic, so
+# ns stays 2. RDNA-gated: nw=8 was tuned on gfx1100 only — other platforms
+# keep the FLA default of 4.
+GDN_CHUNK_H_NUM_WARPS = int(
+    os.getenv(
+        "SGLANG_GDN_CHUNK_H_NUM_WARPS",
+        "8" if is_rdna_supported() else "4",
+    )
+)
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 

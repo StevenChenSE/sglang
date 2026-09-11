@@ -2067,8 +2067,10 @@ void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
   // scale. Falls back to V7 (K=16/iter) otherwise. V7/V8 read A sequentially,
   // so act-order (b_q_perm != null) must skip them and use v5, which honors
   // the perm.
-  const int force_v = wmma_env_int("SGL_RDNA_WMMA_VARIANT");
-  const int force_ks = wmma_env_int("SGL_RDNA_WMMA_KSPLIT");
+  // Read once per process: this launcher is on every prefill GEMM dispatch
+  // and getenv-per-call adds up (~1.5k calls per forward).
+  static const int force_v = wmma_env_int("SGL_RDNA_WMMA_VARIANT");
+  static const int force_ks = wmma_env_int("SGL_RDNA_WMMA_KSPLIT");
   // K-split chooser honoring the forced value when it is legal for the
   // tile's K granularity (kmod = 32 for the k32 tile, 16 otherwise).
   auto pick_split = [&](int m_tile, int n_tile, int kmod) {
